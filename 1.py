@@ -93,12 +93,14 @@ if __name__ == "__main__":
     freqs = w_grid * fs / (2 * np.pi)
 
     # 定义一个模拟二阶低通的频响
-    fc = 23000             # 截止频率 (Hz)
+    fc = 22000             # 截止频率 (Hz)
     wc = 2 * np.pi * fc    # 必须转换为模拟角频率 (rad/s)
-    Q = 20
+    Q = 2
     
     s = 1j * 2 * np.pi * freqs 
-    Hs = wc**2 / (s**2 + s * wc / Q + wc**2)
+    #Hs = wc**2 / (s**2 + s * wc / Q + wc**2)
+    A_gain = 2.0
+    Hs = (s**2 + (wc/Q*A_gain)*s + wc**2) / (s**2 + (wc/(Q*A_gain))*s + wc**2)
     mag_target = np.abs(Hs)
     
     # 转换为算法需要的能量响应 |H(w)|^2
@@ -119,7 +121,7 @@ if __name__ == "__main__":
     plt.xlabel('Frequency (Hz)', fontsize=12)
     plt.ylabel('Magnitude (dB)', fontsize=12)
     plt.xlim(100, 24000)
-    plt.ylim(-30, 30)
+    plt.ylim(-5, 15)
     plt.xscale('log')
     plt.grid(True, which='both', linestyle='--')
     plt.legend(loc='upper left')
