@@ -93,7 +93,7 @@ if __name__ == "__main__":
     freqs = w_grid * fs / (2 * np.pi)
 
     # 定义一个模拟二阶低通的频响
-    fc = 21000             # 截止频率 (Hz)
+    fc = 23000             # 截止频率 (Hz)
     wc = 2 * np.pi * fc    # 必须转换为模拟角频率 (rad/s)
     Q = 20
     
