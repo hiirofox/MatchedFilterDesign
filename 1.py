@@ -88,14 +88,14 @@ def design_matched_iir_from_response(R_target, w_grid, order=4):
 # ================= 测试与绘图：拟合任意自定义曲线 =================
 if __name__ == "__main__":
     fs = 48000
-    num_points = 512
+    num_points = 2048
     w_grid = np.linspace(0, np.pi, num_points)
     freqs = w_grid * fs / (2 * np.pi)
 
     # 定义一个模拟二阶低通的频响
-    fc = 22000             # 截止频率 (Hz)
+    fc = 23000             # 截止频率 (Hz)
     wc = 2 * np.pi * fc    # 必须转换为模拟角频率 (rad/s)
-    Q = 2
+    Q = 10
     
     s = 1j * 2 * np.pi * freqs 
     #Hs = wc**2 / (s**2 + s * wc / Q + wc**2)
@@ -106,21 +106,36 @@ if __name__ == "__main__":
     # 转换为算法需要的能量响应 |H(w)|^2
     R_target = mag_target**2
     # 拟合目标响应
-    target_order = 4
+    target_order = 3
     b_dig, a_dig = design_matched_iir_from_response(R_target, w_grid, order=target_order)
     
-    # 评估我们生成的数字滤波器的实际频响
-    _, h_dig = signal.freqz(b_dig, a_dig, worN=w_grid)
+    # ==========================================
+    # 2. 观测阶段：使用高密度网格还原真实的连续曲线
+    # ==========================================
+    num_plot_points = 128  # 无论拟合用了多少点，画图都用 2048 点保证平滑
+    w_plot = np.linspace(0, np.pi, num_plot_points)
+    freqs_plot = w_plot * fs / (2 * np.pi)
 
-    # 绘图对比
+    # 用高密度网格重新计算模拟原型的真实响应 (作为完美的黑虚线基准)
+    s_plot = 1j * 2 * np.pi * freqs_plot
+    Hs_plot = (s_plot**2 + (wc/Q*A_gain)*s_plot + wc**2) / (s_plot**2 + (wc/(Q*A_gain))*s_plot + wc**2)
+    mag_target_plot = np.abs(Hs_plot)
+
+    # 用高密度网格评估我们算出的数字滤波器系数的实际响应 (蓝实线)
+    _, h_dig_plot = signal.freqz(b_dig, a_dig, worN=w_plot)
+
+    # ==========================================
+    # 3. 绘图对比
+    # ==========================================
     plt.figure(figsize=(10, 6))
-    plt.plot(freqs, 20 * np.log10(mag_target), 'k--', linewidth=2, label='Custom Target Arbitrary Response')
-    plt.plot(freqs, 20 * np.log10(np.abs(h_dig)), 'b-', linewidth=2, alpha=0.8, label=f'Our IIR Fit ({target_order}th order)')
+    plt.plot(freqs_plot, 20 * np.log10(mag_target_plot), 'k--', linewidth=2, label='Analog Prototype Response')
+    plt.plot(freqs_plot, 20 * np.log10(np.abs(h_dig_plot)), 'b-', linewidth=2, alpha=0.8, label=f'Digital IIR Fit ({target_order}th order)')
     
-    plt.title('Arbitrary Magnitude Target Fitting with Direct Least-Squares', fontsize=14)
+    plt.title('Arbitrary Magnitude Target Fitting (Decoupled Evaluation)', fontsize=14)
     plt.xlabel('Frequency (Hz)', fontsize=12)
     plt.ylabel('Magnitude (dB)', fontsize=12)
-    plt.xlim(100, 24000)
+    
+    plt.xlim(23000, 24000)
     plt.ylim(-5, 15)
     plt.xscale('log')
     plt.grid(True, which='both', linestyle='--')

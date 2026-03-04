@@ -1,42 +1,74 @@
 import numpy as np
 import scipy.signal as signal
 import matplotlib.pyplot as plt
+def exact_9point_closed_form_generic(b_a, a_a, fs, wc):
+    """
+    带有温柔引力映射的 32点 超定最小二乘拟合
+    alpha: 聚集程度控制。1.0为纯线性，0.0为极度聚集。推荐 0.4 ~ 0.6
+    """
+    N_points = 2048
+    alpha = 1
+    # ==========================================
+    # 步骤 1：按比例分配与引力映射撒点
+    # ==========================================
+    w_max = np.pi  # 必须钉死在 Nyquist
+    w_d = 2.0 * np.pi * wc / fs
+    w_d = np.clip(w_d, 0, np.pi) # 保护极值，防止贴边
 
-def exact_9point_closed_form_generic(b_a, a_a, fs):
-    """
-    任意模拟原型的 4阶 IIR 纯闭式解设计器
-    输入:
-        b_a, a_a : 任意二阶模拟滤波器的分子分母系数 (S域，如 [b2, b1, b0])
-        fs       : 采样率
-    """
-    # ==========================================
-    # 步骤 1：生成 9 个切比雪夫节点频率，计算目标真实能量
-    # ==========================================
-    k = np.arange(1, 10)
-    #x_nodes = np.cos((2 * k - 1) * np.pi / 18.0) 
-    x_nodes = np.cos(k * np.pi / (9 - 1) * 0.97)
-    w_nodes = np.arccos(x_nodes) 
-    
-    # 将数字角频率映射回真实的模拟角频率 (Omega = w * fs)
+    # 1a. 保持线性密度平衡：按频段比例分配 32 个点
+    N_left = int(np.round(N_points * (w_d / np.pi)))
+    N_left = np.clip(N_left, 6, N_points - 6)  # 保证两边都不会“断粮”
+    N_right = N_points - N_left
+
+    # 1b. 定义温柔的映射函数 (Linear blended with Smoothstep)
+    def gentle_warp(t):
+        return alpha * t + (1.0 - alpha) * (3 * t**2 - 2 * t**3)
+
+    # 1c. 左半段 [0, w_d]
+    # endpoint=False 是为了把 w_d 这个交界点留给右半段，防止点重合
+    t_left = np.linspace(0, 1.0, N_left, endpoint=False) 
+    w_left = w_d * gentle_warp(t_left)
+
+    # 1d. 右半段 [w_d, pi]
+    t_right = np.linspace(0, 1.0, N_right)
+    w_right = w_d + (w_max - w_d) * gentle_warp(t_right)
+
+    # 拼接！得到极度优雅的 32 个节点
+    w_nodes = np.concatenate((w_left, w_right))
+
+    # 计算目标真实能量
     Omega_nodes = w_nodes * fs 
     _, H_a = signal.freqs(b_a, a_a, Omega_nodes)
     R_target = np.abs(H_a)**2
 
     # ==========================================
-    # 步骤 2：解 9x9 线性方程组 (完全闭式的克莱姆法则等效)
+    # 步骤 2：加权超定线性方程组 (Weighted Least-Squares)
     # ==========================================
-    A = np.zeros((9, 9))
+    A = np.zeros((N_points, 9))
     A[:, 0] = 1.0
     for i in range(1, 5):
         A[:, i] = np.cos(i * w_nodes)
         A[:, i+4] = -R_target * np.cos(i * w_nodes)
     
-    # 纯代数矩阵求解（无迭代）
-    coeffs = np.linalg.solve(A, R_target)
+    # --- 魔法加权开始 ---
+    # 1. 抵消 Equation Error 的隐性衰减：用 R_target 的倒数作为基础权重
+    # 加 1e-6 是为了防止除零，取平方根是因为我们算的是幅度
+    W = 1.0 / (np.sqrt(R_target) + 1e-6) 
+    
+    # 2. 独裁者权重：强行把 Nyquist 那个点（最后一个点）的权重放大 1000 倍！
+    # 告诉算法：“哪怕前面全毁了，这个点你也必须给我按在地上！”
+    W[-1] *= 1000.0 
+    
+    # 将权重应用到矩阵 A 和目标向量 R_target 的每一行
+    A_weighted = A * W[:, np.newaxis]
+    R_weighted = R_target * W
+    # --- 魔法加权结束 ---
+    
+    # 使用加权后的矩阵求解
+    coeffs, residuals, rank, s = np.linalg.lstsq(A_weighted, R_weighted, rcond=None)
     
     c = coeffs[0:5]
     d = np.concatenate(([1.0], coeffs[5:9]))
-
     # ==========================================
     # 步骤 3：多项式降维与代数求根 (费拉里法则替代谱分解)
     # ==========================================
@@ -91,9 +123,9 @@ if __name__ == "__main__":
     
     # 【泛化测试】构建一个 18kHz 的高频 Peaking EQ (峰值均衡器)
     # 提升 12dB，Q=2.0。这是极度考验数字滤波器高频映射能力的器型
-    fc = 22000 
+    fc = 23000 
     wc = 2 * np.pi * fc
-    Q = 2.0
+    Q = 10.0
     A_gain = 2.0
     
     # 标准模拟 Peaking EQ 传递函数系数 [s^2, s, 1]
@@ -101,7 +133,7 @@ if __name__ == "__main__":
     a_a = [1.0, (wc/Q) / A_gain, wc**2]
     
     # 一键算出闭式解
-    b_dig, a_dig, w_nodes, R_nodes = exact_9point_closed_form_generic(b_a, a_a, fs)
+    b_dig, a_dig, w_nodes, R_nodes = exact_9point_closed_form_generic(b_a, a_a, fs, fc)
     
     # 评估频响
     freqs = np.linspace(10, 24000, 1000)
@@ -115,13 +147,13 @@ if __name__ == "__main__":
     plt.plot(freqs, 20 * np.log10(np.abs(h_dig)), 'b-', linewidth=2, label='4th-Order Exact Closed-Form')
     
     freqs_nodes = w_nodes * fs / (2 * np.pi)
-    plt.plot(freqs_nodes, 10 * np.log10(R_nodes), 'ro', markersize=6, label='9 Chebyshev Exact Nodes')
+    #plt.plot(freqs_nodes, 10 * np.log10(R_nodes), 'ro', markersize=6, label='9 Chebyshev Exact Nodes')
     
     plt.axvline(fc, color='gray', linestyle=':', label=f'Center Freq ({fc} Hz)')
     plt.title('Generic Analog Prototype to 4th-Order Closed-Form IIR', fontsize=14)
     plt.xlabel('Frequency (Hz)', fontsize=12)
     plt.ylabel('Magnitude (dB)', fontsize=12)
-    plt.xlim(100, 24000)
+    plt.xlim(10000, 24000)
     plt.ylim(-5, 15)
     plt.xscale('log')
     plt.grid(True, which='both', linestyle='--')
