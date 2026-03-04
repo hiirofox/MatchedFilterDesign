@@ -5,146 +5,127 @@ import matplotlib.pyplot as plt
 def spectral_factorization(coeffs):
     """
     对余弦多项式 P(w) = c0 + c1*cos(w) + c2*cos(2w) + ... 进行数值谱分解。
-    返回提取到单位圆内的多项式系数。
     """
     N = len(coeffs) - 1
-    # 1. 构造 2N 阶的对称 Z 域多项式
     poly_z = np.zeros(2 * N + 1)
-    poly_z[N] = coeffs[0]  # 中心常数项
+    poly_z[N] = coeffs[0]  
     for i in range(1, N + 1):
-        poly_z[N - i] = coeffs[i] / 2.0  # z^i
-        poly_z[N + i] = coeffs[i] / 2.0  # z^-i
+        poly_z[N - i] = coeffs[i] / 2.0  
+        poly_z[N + i] = coeffs[i] / 2.0  
 
-    # 2. 求出所有的 2N 个数值根
     roots = np.roots(poly_z)
-
-    # 3. 反射与提取：按照绝对值大小排序，提取最小的那 N 个根
     sorted_indices = np.argsort(np.abs(roots))
     selected_roots = roots[sorted_indices[:N]]
-
-    # 4. 从圆内的根重建稳定的多项式 (z - r1)(z - r2)...
     factor_poly = np.poly(selected_roots)
 
-    # 丢弃极小的数值计算虚部，保证系数为实数
     return np.real(factor_poly)
 
-
-def design_matched_iir(w_grid, H_target, order):
+def design_matched_iir_from_response(R_target, w_grid, order=4):
     """
-    通用有理多项式谱分解 IIR 设计器
-
     输入:
-        w_grid   : 归一化角频率数组，范围 [0, pi] (例如 np.linspace(0, np.pi, num_points))
-        H_target : 对应的目标幅度响应绝对值 (例如 np.abs(H_a))
-        order    : 期望的数字 IIR 滤波器阶数 N (例如 4)
+        R_target : 目标频响的绝对能量响应 |H(w)|^2，长度需与 w_grid 一致
+        w_grid   : 数字角频率网格 [0, pi] (单位: rad/sample)
+        order    : 期望拟合的数字 IIR 滤波器阶数
     输出:
-        b, a     : 设计出的数字 IIR 滤波器系数 (Z域)
+        b, a     : 完美拟合目标曲线的数字 IIR 滤波器系数 (Z域)
     """
-    N = int(order)
+    N = order
     num_points = len(w_grid)
 
-    # === 第一步：获取目标能量响应 ===
-    R_target = np.abs(H_target)**2
+    if len(R_target) != num_points:
+        raise ValueError("R_target 和 w_grid 的长度必须一致！")
 
-    # === 第二步：动态构建最小二乘方程组 A * x = b ===
-    # A 矩阵列数 = (N+1)个分子系数 + N个分母系数 = 2N + 1
-    A = np.zeros((num_points, 2 * N + 1))
+    # === 迭代重加权最小二乘法进行拟合 ===
+    num_iters = 3  
+    W = np.ones(num_points)  
     
-    # 分子部分: c0 + c1*cos(w) + ... + cN*cos(Nw)
-    A[:, 0] = 1.0  # 对应 c0
-    for k in range(1, N + 1):
-        A[:, k] = np.cos(k * w_grid)  # 对应 c_k
+    for iteration in range(num_iters):
+        A = np.zeros((num_points, 2 * N + 1))
+        A[:, 0] = W * 1.0
         
-    # 分母部分 (已移项): -R_target * (d1*cos(w) + ... + dN*cos(Nw))
-    for k in range(1, N + 1):
-        A[:, N + k] = -R_target * np.cos(k * w_grid)  # 对应 d_k
+        for k in range(1, N + 1):
+            A[:, k] = W * np.cos(k * w_grid)
+            A[:, k + N] = -W * R_target * np.cos(k * w_grid)
+            
+        b_vec = W * R_target 
+        
+        x, _, _, _ = np.linalg.lstsq(A, b_vec, rcond=None)
+        
+        d_temp = np.concatenate(([1.0], x[N + 1 : 2 * N + 1]))
+        Q_vals = d_temp[0] + sum(d_temp[k] * np.cos(k * w_grid) for k in range(1, N + 1))
+        W = 1.0 / (np.abs(Q_vals) + 1e-8)
 
-    b_vec = R_target # R_target * 1 (d0=1 的项) 移到等式右侧
+    c = x[0 : N + 1]
+    d = np.concatenate(([1.0], x[N + 1 : 2 * N + 1]))
 
-    # 求解
-    x, residuals, rank, s = np.linalg.lstsq(A, b_vec, rcond=None)
-
-    # 分离 c 和 d 系数
-    c = x[0 : N+1]
-    d = np.concatenate(([1.0], x[N+1 : 2*N+1]))
-
-    # === 第三步：工程安全兜底（强制非负） ===
-    # 动态计算整个频段的 P 和 Q 多项式值
+    # === 工程安全兜底（强制非负） ===
     P_vals = c[0] + sum(c[k] * np.cos(k * w_grid) for k in range(1, N + 1))
     Q_vals = d[0] + sum(d[k] * np.cos(k * w_grid) for k in range(1, N + 1))
     
     if np.min(P_vals) <= 0:
-        c[0] += abs(np.min(P_vals)) + 1e-8
+        c[0] += abs(np.min(P_vals)) + 1e-8  
     if np.min(Q_vals) <= 0:
         d[0] += abs(np.min(Q_vals)) + 1e-8
 
-    # === 第四步：执行谱分解 ===
+    # === 执行谱分解提取稳定解 ===
     b_unscaled = spectral_factorization(c)
     a_final = spectral_factorization(d)
 
-    # === 第五步：增益校准 ===
-    # 选择目标频响能量最大的点进行对齐
-    idx_max = np.argmax(R_target)
-    w_ref = w_grid[idx_max]
-    z_ref = np.exp(1j * w_ref)
-    
-    mag_num = np.abs(np.polyval(b_unscaled, z_ref))
-    mag_den = np.abs(np.polyval(a_final, z_ref))
-    mag_digital = mag_num / mag_den
-    
-    mag_analog = np.sqrt(R_target[idx_max])
-    gain_correction = mag_analog / (mag_digital + 1e-12)
-
+     # === 第五步：增益校准（平均线性增益补偿） ===
+    # 1. 计算目标曲线在整个频率网格上的平均线性幅度
+    # （注意：传入的 R_target 是能量响应，需开方还原为线性幅度）
+    mean_mag_target = np.mean(np.sqrt(R_target))
+    # 2. 计算当前未校准 IIR 滤波器在相同 w_grid 上的真实线性幅度
+    # 使用 freqz 批量计算整个数组，比写 for 循环逐个 polyval 更高效、更数值安全
+    _, h_unscaled = signal.freqz(b_unscaled, a_final, worN=w_grid)
+    mean_mag_digital = np.mean(np.abs(h_unscaled))
+    # 3. 计算补偿比例并缩放分子系数
+    gain_correction = mean_mag_target / (mean_mag_digital + 1e-12)
     b_final = b_unscaled * gain_correction
 
     return b_final, a_final
 
-# ================= 测试与绘图 =================
+# ================= 测试与绘图：拟合任意自定义曲线 =================
 if __name__ == "__main__":
     fs = 48000
-    num_points = 4096
-    
-    # --- 1. 定义我们想要的频段和任意目标频响 ---
-    w_grid = np.linspace(0, np.pi*0.999, num_points)
-    freqs_hz = w_grid * fs / (2 * np.pi)
-    freqs_norm = w_grid / np.pi  # 归一化频率 [0, 1]
-    
-    # 作为一个例子，我们还是用之前的模拟低通，但这次是在外部生成 H_target
-    f0 = 20000  
-    w0 = 2 * np.pi * f0
-    Q = 20.0
-    b_a = [w0**2]
-    a_a = [1.0, w0/Q, w0**2]
-    _, H_target = signal.freqs(b_a, a_a, freqs_hz * 2 * np.pi)
-    
-    # 你甚至可以在这里放一个纯手工画的、不规则的 target 数组！
-    # 只要保证它和 w_grid 长度一致并且大于 0 即可。
-    #H_target = 1 / np.sqrt(1 + (freqs_hz / f0)**4)  # 这是一个更陡峭的低通响应
+    num_points = 512
+    w_grid = np.linspace(0, np.pi, num_points)
+    freqs = w_grid * fs / (2 * np.pi)
 
-    # --- 2. 调用通用设计器 ---
-    target_order = 4 # 你可以把这里改成 6, 8 试试
+    # 定义一个模拟二阶低通的频响
+    fc = 21000             # 截止频率 (Hz)
+    wc = 2 * np.pi * fc    # 必须转换为模拟角频率 (rad/s)
+    Q = 20
     
-    b_custom, a_custom = design_matched_iir(w_grid, H_target, target_order)
+    s = 1j * 2 * np.pi * freqs 
+    Hs = wc**2 / (s**2 + s * wc / Q + wc**2)
+    mag_target = np.abs(Hs)
     
-    # --- 3. 评估与绘图 ---
-    _, h_custom = signal.freqz(b_custom, a_custom, worN=w_grid)
+    # 转换为算法需要的能量响应 |H(w)|^2
+    R_target = mag_target**2
+    # 拟合目标响应
+    target_order = 4
+    b_dig, a_dig = design_matched_iir_from_response(R_target, w_grid, order=target_order)
+    
+    # 评估我们生成的数字滤波器的实际频响
+    _, h_dig = signal.freqz(b_dig, a_dig, worN=w_grid)
 
+    # 绘图对比
     plt.figure(figsize=(10, 6))
-    plt.plot(freqs_hz, 20 * np.log10(np.abs(H_target)), 'k--', linewidth=2, label='Target Magnitude')
-    plt.plot(freqs_hz, 20 * np.log10(np.abs(h_custom)), 'b-', linewidth=2, label=f'Custom Fit ({target_order}th order)')
+    plt.plot(freqs, 20 * np.log10(mag_target), 'k--', linewidth=2, label='Custom Target Arbitrary Response')
+    plt.plot(freqs, 20 * np.log10(np.abs(h_dig)), 'b-', linewidth=2, alpha=0.8, label=f'Our IIR Fit ({target_order}th order)')
     
-    plt.axvline(f0, color='gray', linestyle=':', label=f'Reference Frequency ({f0} Hz)')
-    plt.title(f'Universal Magnitude Fit (N={target_order})', fontsize=14)
+    plt.title('Arbitrary Magnitude Target Fitting with Direct Least-Squares', fontsize=14)
     plt.xlabel('Frequency (Hz)', fontsize=12)
     plt.ylabel('Magnitude (dB)', fontsize=12)
-    plt.xlim(200, 24000)
-    plt.ylim(-40, 40)
+    plt.xlim(100, 24000)
+    plt.ylim(-30, 30)
     plt.xscale('log')
     plt.grid(True, which='both', linestyle='--')
-    plt.legend(loc='lower left')
+    plt.legend(loc='upper left')
     plt.tight_layout()
     plt.show()
 
     print(f"=== 生成的 {target_order} 阶数字滤波器系数 ===")
-    print("b =", np.array2string(b_custom, precision=6))
-    print("a =", np.array2string(a_custom, precision=6))
+    print("b =", np.array2string(b_dig, precision=6))
+    print("a =", np.array2string(a_dig, precision=6))

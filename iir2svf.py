@@ -63,3 +63,6 @@ if __name__ == "__main__":
     print("\n=== 前馈系数 d (对应分子 b 系数) ===")
     for name, expr in d_res.items():
         print(f"{name} = {expr}")
+        
+        
+#积分器h=1/(1-z^-1)
