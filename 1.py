@@ -9,7 +9,6 @@ def spectral_factorization(coeffs):
     """
     N = len(coeffs) - 1
     # 1. 构造 2N 阶的对称 Z 域多项式
-    # 对应的 Z 次幂为 z^N, z^(N-1)... z^0 ... z^(-N)
     poly_z = np.zeros(2 * N + 1)
     poly_z[N] = coeffs[0]  # 中心常数项
     for i in range(1, N + 1):
@@ -19,8 +18,7 @@ def spectral_factorization(coeffs):
     # 2. 求出所有的 2N 个数值根
     roots = np.roots(poly_z)
 
-    # 3. 反射与提取：按照绝对值大小排序，无脑提取最小的那 N 个根
-    # （因为根是成对出现的，最小的一半必定全部 <= 1，即在单位圆内）
+    # 3. 反射与提取：按照绝对值大小排序，提取最小的那 N 个根
     sorted_indices = np.argsort(np.abs(roots))
     selected_roots = roots[sorted_indices[:N]]
 
@@ -31,62 +29,65 @@ def spectral_factorization(coeffs):
     return np.real(factor_poly)
 
 
-def design_matched_iir_4th_order(b_a, a_a, fs, num_points=4096):
+def design_matched_iir(w_grid, H_target, order):
     """
+    通用有理多项式谱分解 IIR 设计器
+
     输入:
-        b_a, a_a : 2阶模拟滤波器的分子分母系数 (S域)
-        fs       : 采样率
+        w_grid   : 归一化角频率数组，范围 [0, pi] (例如 np.linspace(0, np.pi, num_points))
+        H_target : 对应的目标幅度响应绝对值 (例如 np.abs(H_a))
+        order    : 期望的数字 IIR 滤波器阶数 N (例如 4)
     输出:
-        b, a     : 完美拟合模拟频响的 4阶数字 IIR 滤波器系数 (Z域)
+        b, a     : 设计出的数字 IIR 滤波器系数 (Z域)
     """
-    # === 第一步：生成目标频响曲线 ===
-    w_grid = np.linspace(0, np.pi, num_points)
-    Omega_grid = w_grid * fs  # 真实的模拟角频率
+    N = int(order)
+    num_points = len(w_grid)
 
-    # 计算模拟原型的绝对能量响应 R_target = |H(j * Omega)|^2
-    _, H_a = signal.freqs(b_a, a_a, Omega_grid)
-    R_target = np.abs(H_a)**2
+    # === 第一步：获取目标能量响应 ===
+    R_target = np.abs(H_target)**2
 
-    # === 第二步：通过最小二乘法进行有理多项式曲线拟合 ===
-    # 我们要解方程: P(w) - R_target(w) * Q(w) = 0
-    # 其中 P(w) = c0 + c1*cos(w)...c4*cos(4w), Q(w) = 1 + d1*cos(w)...d4*cos(4w)
+    # === 第二步：动态构建最小二乘方程组 A * x = b ===
+    # A 矩阵列数 = (N+1)个分子系数 + N个分母系数 = 2N + 1
+    A = np.zeros((num_points, 2 * N + 1))
     
-    A = np.zeros((num_points, 9))
+    # 分子部分: c0 + c1*cos(w) + ... + cN*cos(Nw)
     A[:, 0] = 1.0  # 对应 c0
-    for k in range(1, 5):
-        A[:, k] = np.cos(k * w_grid)               # 对应 c_k
-        A[:, k+4] = -R_target * np.cos(k * w_grid) # 对应 d_k
+    for k in range(1, N + 1):
+        A[:, k] = np.cos(k * w_grid)  # 对应 c_k
+        
+    # 分母部分 (已移项): -R_target * (d1*cos(w) + ... + dN*cos(Nw))
+    for k in range(1, N + 1):
+        A[:, N + k] = -R_target * np.cos(k * w_grid)  # 对应 d_k
 
-    b_vec = R_target # 将等式右边的 R_target*1 移过去
+    b_vec = R_target # R_target * 1 (d0=1 的项) 移到等式右侧
 
-    # 使用 NumPy 求解超定线性方程组 A * x = b
+    # 求解
     x, residuals, rank, s = np.linalg.lstsq(A, b_vec, rcond=None)
 
-    # 分离出拟合得到的 c 和 d 系数
-    c = x[0:5]
-    d = np.concatenate(([1.0], x[5:9]))
+    # 分离 c 和 d 系数
+    c = x[0 : N+1]
+    d = np.concatenate(([1.0], x[N+1 : 2*N+1]))
 
     # === 第三步：工程安全兜底（强制非负） ===
-    # 极其重要：如果数值拟合在极高频出现了微小的负数，谱分解必定失败！
-    P_vals = c[0] + sum(c[k]*np.cos(k*w_grid) for k in range(1, 5))
-    Q_vals = d[0] + sum(d[k]*np.cos(k*w_grid) for k in range(1, 5))
+    # 动态计算整个频段的 P 和 Q 多项式值
+    P_vals = c[0] + sum(c[k] * np.cos(k * w_grid) for k in range(1, N + 1))
+    Q_vals = d[0] + sum(d[k] * np.cos(k * w_grid) for k in range(1, N + 1))
     
     if np.min(P_vals) <= 0:
-        c[0] += abs(np.min(P_vals)) + 1e-8  # 抬高一点点保证绝对大于0
+        c[0] += abs(np.min(P_vals)) + 1e-8
     if np.min(Q_vals) <= 0:
         d[0] += abs(np.min(Q_vals)) + 1e-8
 
-    # === 第四步：执行谱分解提取稳定解 ===
+    # === 第四步：执行谱分解 ===
     b_unscaled = spectral_factorization(c)
     a_final = spectral_factorization(d)
 
     # === 第五步：增益校准 ===
-    # 随便找一个参考点对齐能量，这里选择目标频响能量最大的点
+    # 选择目标频响能量最大的点进行对齐
     idx_max = np.argmax(R_target)
     w_ref = w_grid[idx_max]
     z_ref = np.exp(1j * w_ref)
     
-    # 评测我们拆出来的数字多项式在这个频率的增益
     mag_num = np.abs(np.polyval(b_unscaled, z_ref))
     mag_den = np.abs(np.polyval(a_final, z_ref))
     mag_digital = mag_num / mag_den
@@ -98,42 +99,42 @@ def design_matched_iir_4th_order(b_a, a_a, fs, num_points=4096):
 
     return b_final, a_final
 
-# ================= 测试与绘图对比 =================
+# ================= 测试与绘图 =================
 if __name__ == "__main__":
     fs = 48000
-    # 我们故意设计一个 15kHz 的 2阶低通滤波器
-    # 这种高频下，传统的双线性变换会产生极其严重的频率扭曲
-    f0 = 22000  
-    w0 = 2 * np.pi * f0
-    Q = 10.0
+    num_points = 4096
     
-    # 2阶模拟低通参数 (w0^2 / (s^2 + s*(w0/Q) + w0^2))
+    # --- 1. 定义我们想要的频段和任意目标频响 ---
+    w_grid = np.linspace(0, np.pi*0.999, num_points)
+    freqs_hz = w_grid * fs / (2 * np.pi)
+    freqs_norm = w_grid / np.pi  # 归一化频率 [0, 1]
+    
+    # 作为一个例子，我们还是用之前的模拟低通，但这次是在外部生成 H_target
+    f0 = 20000  
+    w0 = 2 * np.pi * f0
+    Q = 20.0
     b_a = [w0**2]
     a_a = [1.0, w0/Q, w0**2]
-
-    # 1. 使用我们的自研 4阶设计器
-    b_4th, a_4th = design_matched_iir_4th_order(b_a, a_a, fs)
+    _, H_target = signal.freqs(b_a, a_a, freqs_hz * 2 * np.pi)
     
-    # 2. 作为反面教材：使用标准 SciPy 的双线性变换 (2阶)
-    # 注意：这里我们故意不做预映射，以展示纯 BLT 的扭曲
-    b_blt, a_blt = signal.bilinear(b_a, a_a, fs=fs)
+    # 你甚至可以在这里放一个纯手工画的、不规则的 target 数组！
+    # 只要保证它和 w_grid 长度一致并且大于 0 即可。
+    #H_target = 1 / np.sqrt(1 + (freqs_hz / f0)**4)  # 这是一个更陡峭的低通响应
 
-    # 评估三种滤波器的频响
-    freqs = np.linspace(10, 24000, 1000)
-    w_digital = 2 * np.pi * freqs / fs
+    # --- 2. 调用通用设计器 ---
+    target_order = 4 # 你可以把这里改成 6, 8 试试
     
-    _, h_analog = signal.freqs(b_a, a_a, 2 * np.pi * freqs)
-    _, h_4th = signal.freqz(b_4th, a_4th, worN=w_digital)
-    _, h_blt = signal.freqz(b_blt, a_blt, worN=w_digital)
+    b_custom, a_custom = design_matched_iir(w_grid, H_target, target_order)
+    
+    # --- 3. 评估与绘图 ---
+    _, h_custom = signal.freqz(b_custom, a_custom, worN=w_grid)
 
-    # 绘图
     plt.figure(figsize=(10, 6))
-    plt.plot(freqs, 20 * np.log10(np.abs(h_analog)), 'k--', linewidth=2, label='Target Analog Prototype (2nd order)')
-    plt.plot(freqs, 20 * np.log10(np.abs(h_blt)), 'r-', alpha=0.7, label='Standard BLT (2nd order) - Note the warping!')
-    plt.plot(freqs, 20 * np.log10(np.abs(h_4th)), 'b-', linewidth=2, label='Our 4th-order Spectral Factorization Fit')
+    plt.plot(freqs_hz, 20 * np.log10(np.abs(H_target)), 'k--', linewidth=2, label='Target Magnitude')
+    plt.plot(freqs_hz, 20 * np.log10(np.abs(h_custom)), 'b-', linewidth=2, label=f'Custom Fit ({target_order}th order)')
     
-    plt.axvline(f0, color='gray', linestyle=':', label=f'Cutoff Frequency ({f0} Hz)')
-    plt.title('Magnitude Response: Analog Prototype vs. Digital Filters', fontsize=14)
+    plt.axvline(f0, color='gray', linestyle=':', label=f'Reference Frequency ({f0} Hz)')
+    plt.title(f'Universal Magnitude Fit (N={target_order})', fontsize=14)
     plt.xlabel('Frequency (Hz)', fontsize=12)
     plt.ylabel('Magnitude (dB)', fontsize=12)
     plt.xlim(200, 24000)
@@ -144,6 +145,6 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show()
 
-    print("=== 生成的 4 阶数字滤波器系数 ===")
-    print("b =", np.array2string(b_4th, precision=6))
-    print("a =", np.array2string(a_4th, precision=6))
+    print(f"=== 生成的 {target_order} 阶数字滤波器系数 ===")
+    print("b =", np.array2string(b_custom, precision=6))
+    print("a =", np.array2string(a_custom, precision=6))

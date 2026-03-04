@@ -1,4 +1,5 @@
 import sympy as sp
+import symengine as se
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
@@ -42,9 +43,14 @@ def design_frequency_pade_symbolic(target_expr, z_inv, M, N):
         equations.append(sp.Eq(coeff, 0))
     
     coefficients = list(b_syms) + list(a_syms)
+    
     solution = sp.solve(equations, coefficients)
     
+    #raw_solution = se.linsolve(equations, coefficients)
+    #solution = dict(zip(coefficients, raw_solution))
+    
     return solution, b_syms, a_syms
+
 
 if __name__ == "__main__":
     z_inv = sp.Symbol('z_inv')
@@ -58,7 +64,8 @@ if __name__ == "__main__":
     q = sp.Symbol('q')
     
     # 1. 定义模拟原型滤波器 Hs(s)
-    target_Hs = w0*w0 / (s*s + 2*q*w0*s + w0*w0)
+    target_Hs = w0*w0 / (s*s + w0*s/q + w0*w0)
+    #target_Hs = s*s / (s*s + w0*s/q + w0*w0)
     
     # 2. 使用绝对严格的对数映射！
     # 因为我们在 z_inv=1 处展开，此时 s = -ln(1)/T = 0，完全解析！
@@ -69,6 +76,7 @@ if __name__ == "__main__":
     
     # 3. 解析求解
     sol, b_syms, a_syms = design_frequency_pade_symbolic(target_H, z_inv, M, N)
+
     
     # 4. 打印解析表达式
     print(f"=== 分子系数 (FIR 部分, 阶数 M={M}) ===")
@@ -102,8 +110,10 @@ if __name__ == "__main__":
     # 生成对数频率轴 (从 10 Hz 到 奈奎斯特频率)
     f = np.logspace(1, np.log10(Fs/2 - 1), 1000)
     omega = 2 * np.pi * f
-    s_val = 1j * omega
     z_inv_val = np.exp(-1j * omega * T_val)
+    
+    # 预编译目标模拟滤波器为 numpy 函数
+    target_Hs_func = sp.lambdify((w0, q, s), target_Hs, "numpy")
 
     # 初始参数
     init_f0 = 1000.0
@@ -125,7 +135,7 @@ if __name__ == "__main__":
     ax_q = plt.axes([0.15, 0.08, 0.7, 0.03])
     
     # 注意 f0 滑动条的范围也是对数的
-    slider_f0 = Slider(ax_f0, 'Cutoff f0 (Hz)', np.log10(20), np.log10(20000), valinit=np.log10(init_f0))
+    slider_f0 = Slider(ax_f0, 'Cutoff f0 (Hz)', np.log10(0.02), np.log10(24000), valinit=np.log10(init_f0))
     slider_q = Slider(ax_q, 'Damping q', 0.1, 5.0, valinit=init_q)
 
     # 自定义滑动条显示的文本格式
@@ -140,8 +150,9 @@ if __name__ == "__main__":
         curr_q = slider_q.val
         
         # 2. 计算模拟滤波器的理想频响 (dB)
-        Hs = (curr_w0**2) / (s_val**2 + 2*curr_q*curr_w0*s_val + curr_w0**2)
-        mag_Hs = 20 * np.log10(np.abs(Hs) + 1e-12)
+        # 为模拟滤波器创建 numpy 函数用于频率向量计算
+        target_Hs_func_val = sp.lambdify((w0, q, s), target_Hs, "numpy")
+        mag_Hs = 20 * np.log10(np.abs(target_Hs_func_val(curr_w0, curr_q, 1j * omega)) + 1e-12)
         
         # 3. 将数值代入编译好的系数函数中
         b_vals = [func(T_val, curr_w0, curr_q) for func in b_funcs]
