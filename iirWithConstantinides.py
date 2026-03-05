@@ -3,7 +3,7 @@ import sympy as sp
 def generate_warped_iir_code():
     # 1. 定义符号
     b0, b1, b2, b3, b4 = sp.symbols('b0 b1 b2 b3 b4')
-    a0, a1, a2, a3, a4 = sp.symbols('a0 a1 a2 a3 a4')
+    a0, a1, a2, a3, a4 = sp.symbols('1 a1 a2 a3 a4')
     alpha = sp.symbols('alpha')
     Z = sp.symbols('Z') # 代表 z^-1
 
