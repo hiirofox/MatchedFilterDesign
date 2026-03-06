@@ -18,10 +18,10 @@ function compare_matched_iir_methods()
     %% =========================
     % 1. 定义模拟目标幅度
     % ==========================
-    fc = 23000;
+    fc = 230;
     wc = 2 * pi * fc;
     Q = 2;
-    stages = 3;
+    stages = 6;
 
     s = 1j * 2 * pi * freqs;
     
@@ -981,30 +981,6 @@ function ok = is_valid_digital_filter(b, a, w_grid)
     end
 end
 
-%% ============================================================
-% 评估
-% =============================================================
-function out = evaluate_method(name, b, a, R_target, w_grid, fs)
-    mag_target = sqrt(max(R_target, 0));
-    h = freqz(b, a, w_grid);
-    mag = abs(h);
-
-    err_lin = mag - mag_target;
-    err_db  = 20*log10(mag + 1e-15) - 20*log10(mag_target + 1e-15);
-
-    p = roots(a);
-
-    out.name = name;
-    out.b = b;
-    out.a = a;
-    out.mse_linear = mean(err_lin.^2);
-    out.rmse_db = sqrt(mean(err_db.^2));
-    out.max_db_abs = max(abs(err_db));
-    out.max_pole_radius = max(abs(p));
-    out.is_stable = all(abs(p) < 1 - 1e-10);
-
-    [out.h_plot, out.f_plot] = freqz(b, a, 4096, fs);
-end
 
 %% ============================================================
 % 工具函数
@@ -1110,7 +1086,7 @@ function [b_best, a_best, a_best_scalar, warp_info] = design_with_warped_target(
     warp_info = struct();
     warp_info.method = method_name;
 
-    warp_info.a_initial = 0.0;
+    warp_info.a_initial = 0;
     warp_info.a_final   = a_best_scalar;
 
     warp_info.score_initial = base_score;
@@ -1128,11 +1104,15 @@ function [b_best, a_best, a_best_scalar, warp_info] = design_with_warped_target(
     warp_info.mse_drop    = base_eval.mse_linear - best_eval.mse_linear;
     warp_info.mse_drop_pct = 100 * (base_eval.mse_linear - best_eval.mse_linear) / max(base_eval.mse_linear, 1e-20);
 end
-function [a_best, best_score, b_best, a_best_tf, best_eval] = optimize_warp_parameter_binary( ...
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%
+%优化器的优化器实现：
+
+function [a_best, best_score, b_best, a_best_tf, best_eval] = optimize_warp_parameter_binary2( ...
     design_fn, R_target, w_grid, order, fs, method_name)
 
-    left = 0.0;
-    right = 0.92;
+    left = -0.99;
+    right = 0.99;
     n_iter = 7;
 
     a_best = 0.0;
@@ -1181,6 +1161,229 @@ function [a_best, best_score, b_best, a_best_tf, best_eval] = optimize_warp_para
         best_eval = evalm;
     end
 end
+
+function [a_best, best_score, b_best, a_best_tf, best_eval] = optimize_warp_parameter_binary( ...
+    design_fn, R_target, w_grid, order, fs, method_name)
+
+    % ============================================================
+    % Extreme warp-parameter optimizer
+    %
+    % Strategy:
+    %   1) Search in u-space, with a = tanh(u)
+    %   2) Coarse structured scan in u-space
+    %   3) Pick best local basin
+    %   4) Golden-section refinement in u-space
+    %   5) Small local polish around the best point
+    %
+    % Designed for:
+    %   - expensive eval_one_warp_candidate(...)
+    %   - noisy / mildly multi-modal score(a)
+    %   - a in (-1, 1), with strong edge sensitivity near +-1
+    %
+    % Typical eval count:
+    %   around 14 ~ 20, configurable below
+    % ============================================================
+
+    % ---- search settings ----
+    max_evals      = 20;     % total expensive eval budget
+    u_bound        = 10;    % tanh(2.8) ~= 0.9926
+    golden_iters   = 10;     % refinement iterations (1 eval / iter max)
+    do_final_polish = true;  % 2 extra local checks if budget allows
+
+    % ---- outputs ----
+    a_best = 0.0;
+    best_score = inf;
+    b_best = [];
+    a_best_tf = [];
+    best_eval = [];
+
+    % ---- cache ----
+    u_cache = [];
+    a_cache = [];
+    f_cache = [];
+    b_cache = {};
+    atf_cache = {};
+    eval_cache = {};
+
+    % ============================================================
+    % cached evaluator in u-space
+    % ============================================================
+    function [f, b_cur, a_tf_cur, eval_cur, a_cur] = eval_cached_u(u)
+        % clamp u to search range
+        u = max(min(u, u_bound), -u_bound);
+        a_cur = tanh(u);
+
+        % reuse cached result if same u already evaluated
+        if ~isempty(u_cache)
+            idx = find(abs(u_cache - u) <= 1e-14, 1);
+            if ~isempty(idx)
+                f        = f_cache(idx);
+                b_cur    = b_cache{idx};
+                a_tf_cur = atf_cache{idx};
+                eval_cur = eval_cache{idx};
+                a_cur    = a_cache(idx);
+                return;
+            end
+        end
+
+        [f, b_cur, a_tf_cur, eval_cur] = eval_one_warp_candidate( ...
+            design_fn, R_target, w_grid, order, fs, method_name, a_cur);
+
+        if ~isfinite(f)
+            f = inf;
+        end
+
+        u_cache(end+1)       = u;
+        a_cache(end+1)       = a_cur;
+        f_cache(end+1)       = f;
+        b_cache{end+1}       = b_cur;
+        atf_cache{end+1}     = a_tf_cur;
+        eval_cache{end+1}    = eval_cur;
+
+        if f < best_score
+            best_score = f;
+            a_best = a_cur;
+            b_best = b_cur;
+            a_best_tf = a_tf_cur;
+            best_eval = eval_cur;
+        end
+    end
+
+    % ============================================================
+    % helper: count evals
+    % ============================================================
+    function n = n_evals()
+        n = numel(f_cache);
+    end
+
+    % ============================================================
+    % 1) coarse structured scan in u-space
+    %
+    % symmetric but stretched enough to touch near-edge behavior
+    %   u = [-2.0, -0.6, 0, 0.6, 2.0]
+    %   a = [-0.964, -0.537, 0, 0.537, 0.964]
+    % ============================================================
+    u0 = [-2.0, -0.6, 0.0, 0.6, 2.0];
+    f0 = inf(size(u0));
+
+    for k = 1:numel(u0)
+        if n_evals() >= max_evals
+            return;
+        end
+        [f0(k), ~, ~, ~, ~] = eval_cached_u(u0(k));
+    end
+
+    % ============================================================
+    % 2) choose a basin to refine
+    %
+    % We want a bracket [ul, ur] around a promising local region.
+    % If best point is at the edge, we add one more point outward/inward
+    % to avoid refining a bad boundary artifact.
+    % ============================================================
+    [~, idx_best0] = min(f0);
+
+    if idx_best0 == 1
+        % best at left edge: add one point between u0(1) and u0(2)
+        u_extra = 0.5 * (u0(1) + u0(2));
+        if n_evals() < max_evals
+            [f_extra, ~, ~, ~, ~] = eval_cached_u(u_extra);
+            if f_extra < f0(1)
+                ul = -u_bound;
+                ur = u0(2);
+            else
+                ul = u0(1);
+                ur = u0(2);
+            end
+        else
+            ul = u0(1);
+            ur = u0(2);
+        end
+
+    elseif idx_best0 == numel(u0)
+        % best at right edge: add one point between u0(end-1) and u0(end)
+        u_extra = 0.5 * (u0(end-1) + u0(end));
+        if n_evals() < max_evals
+            [f_extra, ~, ~, ~, ~] = eval_cached_u(u_extra);
+            if f_extra < f0(end)
+                ul = u0(end-1);
+                ur = u_bound;
+            else
+                ul = u0(end-1);
+                ur = u0(end);
+            end
+        else
+            ul = u0(end-1);
+            ur = u0(end);
+        end
+
+    else
+        % interior best: use its two neighbors as the initial bracket
+        ul = u0(idx_best0 - 1);
+        ur = u0(idx_best0 + 1);
+    end
+
+    % ============================================================
+    % 3) golden-section refinement in u-space
+    %
+    % robust for noisy objectives, 1 new eval per loop
+    % ============================================================
+    phi = (sqrt(5) - 1) / 2;   % 0.618...
+    x1 = ur - phi * (ur - ul);
+    x2 = ul + phi * (ur - ul);
+
+    [f1, ~, ~, ~, ~] = eval_cached_u(x1);
+    if n_evals() < max_evals
+        [f2, ~, ~, ~, ~] = eval_cached_u(x2);
+    else
+        return;
+    end
+
+    for it = 1:golden_iters
+        if n_evals() >= max_evals
+            break;
+        end
+
+        if f1 <= f2
+            ur = x2;
+            x2 = x1;
+            f2 = f1;
+
+            x1 = ur - phi * (ur - ul);
+            [f1, ~, ~, ~, ~] = eval_cached_u(x1);
+        else
+            ul = x1;
+            x1 = x2;
+            f1 = f2;
+
+            x2 = ul + phi * (ur - ul);
+            [f2, ~, ~, ~, ~] = eval_cached_u(x2);
+        end
+    end
+
+    % ============================================================
+    % 4) optional local polish around current best in u-space
+    %
+    % this helps when best point lies on a shallow noisy plateau
+    % ============================================================
+    if do_final_polish && n_evals() < max_evals
+        % locate the current best u in cache
+        [~, idxg] = min(f_cache);
+        u_star = u_cache(idxg);
+
+        % local step based on current bracket width
+        du = 0.15 * max(ur - ul, 0.05);
+
+        if n_evals() < max_evals
+            eval_cached_u(u_star - du);
+        end
+        if n_evals() < max_evals
+            eval_cached_u(u_star + du);
+        end
+    end
+
+    % done: global best already tracked in cache
+end
+%%%%%%%%%%%%%%%%%%%%%%
 function [score, b_final, a_final, eval_out] = eval_one_warp_candidate( ...
     design_fn, R_target, w_grid, order, fs, method_name, awarp)
 
@@ -1214,6 +1417,30 @@ function [score, b_final, a_final, eval_out] = eval_one_warp_candidate( ...
     end
 end
 
+%% ============================================================
+% 评估
+% =============================================================
+function out = evaluate_method(name, b, a, R_target, w_grid, fs)
+    mag_target = sqrt(max(R_target, 0));
+    h = freqz(b, a, w_grid);
+    mag = abs(h);
+
+    err_lin = mag - mag_target;
+    err_db  = 20*log10(mag + 1e-15) - 20*log10(mag_target + 1e-15);
+
+    p = roots(a);
+
+    out.name = name;
+    out.b = b;
+    out.a = a;
+    out.mse_linear = mean(err_lin.^2);
+    out.rmse_db = sqrt(mean(err_db.^2));
+    out.max_db_abs = max(abs(err_db));
+    out.max_pole_radius = max(abs(p));
+    out.is_stable = all(abs(p) < 1 - 1e-10);
+
+    [out.h_plot, out.f_plot] = freqz(b, a, 4096, fs);
+end
 function s = combined_error_score(out)
     s = out.rmse_db ...
       + 0.15 * out.max_db_abs ...
@@ -1227,6 +1454,8 @@ function s = combined_error_score(out)
         s = s + 50;
     end
 end
+
+%%
 function [w_map_sorted, idx_sort] = warp_frequency_grid(w_grid, a)
     % 与最终结构替换完全一致的映射：
     % z2 = (a - z) / (1 - a z), z = e^{jw}
