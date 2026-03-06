@@ -1,3 +1,4 @@
+
 function compare_matched_iir_methods()
     clc; close all;
 
@@ -17,10 +18,10 @@ function compare_matched_iir_methods()
     %% =========================
     % 1. 定义模拟目标幅度
     % ==========================
-    fc = 1600;
+    fc = 23000;
     wc = 2 * pi * fc;
     Q = 2;
-    stages = 6;
+    stages = 3;
 
     s = 1j * 2 * pi * freqs;
     
@@ -40,42 +41,54 @@ function compare_matched_iir_methods()
         1j * ((abs(imag(s))/wc_comp).^stages / Q) ));
 
     % 你可以切换目标
-    Hs_obj = Hs_peaking(s);
+    Hs_obj = Hs_lowpass(s);
     mag_target = abs(Hs_obj);
     R_target = mag_target.^2;
 
     %% =========================
-    % 2. 设计多个版本
+    % 2. 设计多个版本（加入预扭曲优化 a）
     % ==========================
     methods = {};
     results = struct([]);
+    warp_infos = struct( ...
+    'method',{}, ...
+    'a_initial',{}, ...
+    'a_final',{}, ...
+    'score_initial',{}, ...
+    'score_final',{}, ...
+    'score_drop',{}, ...
+    'score_drop_pct',{}, ...
+    'rmse_db_initial',{}, ...
+    'rmse_db_final',{}, ...
+    'rmse_db_drop',{}, ...
+    'rmse_db_drop_pct',{}, ...
+    'mse_initial',{}, ...
+    'mse_final',{}, ...
+    'mse_drop',{}, ...
+    'mse_drop_pct',{});
 
-    % ---- 方法 1: 你的谱分解 IRLS ----
-    [b1, a1] = design_matched_iir_spectral(R_target, w_grid, order);
-    methods{end+1} = 'spectral-irls';
+    % ---- 方法 1: spectral-irls ----
+    design_fn = @(Rt, wg, ord, fs_) design_matched_iir_spectral(Rt, wg, ord);
+    [b1, a1, aopt1, winfo] = design_with_warped_target(design_fn, R_target, w_grid, order, fs, 'spectral-irls');
+    warp_infos(end+1) = winfo;
+    methods{end+1} = sprintf('spectral-irls (a=%.4f)', aopt1);
     tmp = evaluate_method(methods{end}, b1, a1, R_target, w_grid, fs);
-    if isempty(results)
-       results = tmp;
-    else
-        results(end+1) = tmp;
-    end
+    if isempty(results), results = tmp; else, results(end+1) = tmp; end
 
     % ---- 方法 2: 最小相位 + invfreqz ----
-    [b2, a2] = design_matched_iir_invfreqz(R_target, w_grid, order);
-    methods{end+1} = 'minphase-invfreqz';
+    design_fn = @(Rt, wg, ord, fs_) design_matched_iir_invfreqz(Rt, wg, ord);
+    [b2, a2, aopt2, winfo] = design_with_warped_target(design_fn, R_target, w_grid, order, fs, 'minphase-invfreqz');
+    warp_infos(end+1) = winfo;
+    methods{end+1} = sprintf('minphase-invfreqz (a=%.4f)', aopt2);
     tmp = evaluate_method(methods{end}, b2, a2, R_target, w_grid, fs);
-    if isempty(results)
-       results = tmp;
-    else
-        results(end+1) = tmp;
-    end
-
+    if isempty(results), results = tmp; else, results(end+1) = tmp; end
 
     % ---- 方法 2b: 最小相位恢复 + prony ----
-    
     try
-        [b2b, a2b] = design_matched_iir_prony_minphase(R_target, w_grid, order);
-        methods{end+1} = 'minphase-prony';
+        design_fn = @(Rt, wg, ord, fs_) design_matched_iir_prony_minphase(Rt, wg, ord);
+        [b2b, a2b, aopt2b, winfo] = design_with_warped_target(design_fn, R_target, w_grid, order, fs, 'minphase-prony');
+        warp_infos(end+1) = winfo;
+        methods{end+1} = sprintf('minphase-prony (a=%.4f)', aopt2b);
         results(end+1) = evaluate_method(methods{end}, b2b, a2b, R_target, w_grid, fs);
     catch ME
         warning('minphase-prony failed: %s', ME.message);
@@ -83,8 +96,10 @@ function compare_matched_iir_methods()
     
     % ---- 方法 2c: 最小相位恢复 + stmcb ----
     try
-        [b2c, a2c] = design_matched_iir_stmcb_minphase(R_target, w_grid, order);
-        methods{end+1} = 'minphase-stmcb';
+        design_fn = @(Rt, wg, ord, fs_) design_matched_iir_stmcb_minphase(Rt, wg, ord);
+        [b2c, a2c, aopt2c, winfo] = design_with_warped_target(design_fn, R_target, w_grid, order, fs, 'minphase-stmcb');
+        warp_infos(end+1) = winfo;
+        methods{end+1} = sprintf('minphase-stmcb (a=%.4f)', aopt2c);
         results(end+1) = evaluate_method(methods{end}, b2c, a2c, R_target, w_grid, fs);
     catch ME
         warning('minphase-stmcb failed: %s', ME.message);
@@ -92,66 +107,95 @@ function compare_matched_iir_methods()
 
     % ---- 方法 3: yulewalk ----
     try
-        [b3, a3] = design_matched_iir_yulewalk(R_target, w_grid, order);
-        methods{end+1} = 'yulewalk-stmcb';
+        design_fn = @(Rt, wg, ord, fs_) design_matched_iir_yulewalk(Rt, wg, ord);
+        [b3, a3, aopt3, winfo] = design_with_warped_target(design_fn, R_target, w_grid, order, fs, 'yulewalk-stmcb');
+        warp_infos(end+1) = winfo;
+        methods{end+1} = sprintf('yulewalk-stmcb (a=%.4f)', aopt3);
         tmp = evaluate_method(methods{end}, b3, a3, R_target, w_grid, fs);
-        if isempty(results)
-           results = tmp;
-        else
-            results(end+1) = tmp;
-        end
+        if isempty(results), results = tmp; else, results(end+1) = tmp; end
     catch ME
         warning('yulewalk failed: %s', ME.message);
     end
 
     % ---- 方法 4: iirlpnorm ----
     try
-        [b4, a4] = design_matched_iir_iirlpnorm(R_target, w_grid, order);
-        methods{end+1} = 'iirlpnorm';
+        design_fn = @(Rt, wg, ord, fs_) design_matched_iir_iirlpnorm(Rt, wg, ord);
+        [b4, a4, aopt4, winfo] = design_with_warped_target(design_fn, R_target, w_grid, order, fs, 'iirlpnorm');
+        warp_infos(end+1) = winfo;
+        methods{end+1} = sprintf('iirlpnorm (a=%.4f)', aopt4);
         tmp = evaluate_method(methods{end}, b4, a4, R_target, w_grid, fs);
-        if isempty(results)
-           results = tmp;
-        else
-            results(end+1) = tmp;
-        end
+        if isempty(results), results = tmp; else, results(end+1) = tmp; end
     catch ME
         warning('iirlpnorm failed (maybe DSP System Toolbox missing): %s', ME.message);
     end
 
     % ---- 方法 5: analog invfreqs + matched discretization ----
     try
-        [b5, a5] = design_matched_iir_analog_matched(R_target, w_grid, order, fs);
-        methods{end+1} = 'analog-invfreqs-matched';
+        design_fn = @(Rt, wg, ord, fs_) design_matched_iir_analog_matched(Rt, wg, ord, fs_);
+        [b5, a5, aopt5, winfo] = design_with_warped_target(design_fn, R_target, w_grid, order, fs, 'analog-invfreqs-matched');
+        warp_infos(end+1) = winfo;
+        methods{end+1} = sprintf('analog-invfreqs-matched (a=%.4f)', aopt5);
         tmp = evaluate_method(methods{end}, b5, a5, R_target, w_grid, fs);
-        if isempty(results)
-           results = tmp;
-        else
-            results(end+1) = tmp;
-        end
+        if isempty(results), results = tmp; else, results(end+1) = tmp; end
     catch ME
-        warning('analog matched failed (maybe Control/System ID related capability missing): %s', ME.message);
+        warning('analog matched failed: %s', ME.message);
     end
 
     %% =========================
     % 3. 打印结果表
     % ==========================
     fprintf('\n==================== comparison ====================\n');
-    fprintf('%-24s | %-12s | %-12s | %-12s | %-10s | %-8s\n', ...
+    fprintf('%-32s | %-12s | %-12s | %-12s | %-10s | %-8s\n', ...
         'method', 'lin-MSE', 'dB-RMSE', 'max|dB|', 'max|p|', 'stable');
-    fprintf('%s\n', repmat('-', 1, 92));
-
+    fprintf('%s\n', repmat('-', 1, 104));
+    
     for k = 1:numel(results)
-        fprintf('%-24s | %-12.4e | %-12.4e | %-12.4e | %-10.6f | %-8d\n', ...
+        fprintf('%-32s | %-12.4e | %-12.4e | %-12.4e | %-10.6f | %-8d\n', ...
             results(k).name, results(k).mse_linear, results(k).rmse_db, ...
             results(k).max_db_abs, results(k).max_pole_radius, results(k).is_stable);
     end
-
-    % 找最优
+    
     [~, idx_best_mse] = min([results.mse_linear]);
     [~, idx_best_db ] = min([results.rmse_db]);
-
+    
     fprintf('\nBest by linear MSE : %s\n', results(idx_best_mse).name);
     fprintf('Best by dB RMSE    : %s\n', results(idx_best_db).name);
+    
+    %% =========================
+    % 3b. 打印 warp 优化表
+    % ==========================
+    fprintf('\n==================== warp optimization summary ====================\n');
+    fprintf('%-24s | %-8s | %-8s | %-12s | %-12s | %-10s | %-10s\n', ...
+        'method', 'a_init', 'a_final', 'RMSE0(dB)', 'RMSE1(dB)', 'drop', 'drop(%%)');
+    fprintf('%s\n', repmat('-', 1, 106));
+    
+    for k = 1:numel(warp_infos)
+        fprintf('%-24s | %-8.4f | %-8.4f | %-12.4e | %-12.4e | %-10.4e | %-9.2f\n', ...
+            warp_infos(k).method, ...
+            warp_infos(k).a_initial, ...
+            warp_infos(k).a_final, ...
+            warp_infos(k).rmse_db_initial, ...
+            warp_infos(k).rmse_db_final, ...
+            warp_infos(k).rmse_db_drop, ...
+            warp_infos(k).rmse_db_drop_pct);
+    end
+    
+    %% =========================
+    % 3c. 打印更完整的误差改变量
+    % ==========================
+    fprintf('\n==================== error reduction detail ====================\n');
+    fprintf('%-24s | %-12s | %-12s | %-12s | %-12s\n', ...
+        'method', 'score_drop', 'score_drop%', 'mse_drop', 'mse_drop%');
+    fprintf('%s\n', repmat('-', 1, 84));
+    
+    for k = 1:numel(warp_infos)
+        fprintf('%-24s | %-12.4e | %-12.2f | %-12.4e | %-12.2f\n', ...
+            warp_infos(k).method, ...
+            warp_infos(k).score_drop, ...
+            warp_infos(k).score_drop_pct, ...
+            warp_infos(k).mse_drop, ...
+            warp_infos(k).mse_drop_pct);
+    end
 
     %% =========================
     % 4. 绘图
@@ -166,14 +210,13 @@ function compare_matched_iir_methods()
         legends{end+1} = results(k).name; %#ok<AGROW>
     end
     grid on;
-    xlim([100, 24000]);
+    xlim([20, 24000]);
     ylim([-40, 20]);
     xlabel('Frequency (Hz)');
     ylabel('Magnitude (dB)');
-    title('4th-order IIR fitting comparison');
+    title('Warp-assisted IIR fitting comparison');
     legend(legends, 'Location', 'best');
 
-    % 误差图
     figure('Name', 'Magnitude error compare');
     for k = 1:numel(results)
         [h, ~] = freqz(results(k).b, results(k).a, w_grid);
@@ -188,7 +231,6 @@ function compare_matched_iir_methods()
     title('Magnitude error vs target');
     legend(methods, 'Location', 'best');
 
-    % 极点零点图
     figure('Name', 'Pole-zero maps');
     nshow = numel(results);
     nrow = ceil(nshow / 2);
@@ -1028,4 +1070,269 @@ function b = calibrate_gain_passband_ls(b, a, mag_target, w_grid)
     g = sum(mc .* mt) / (sum(mc.^2) + 1e-12);
 
     b = real(b * g);
+end
+
+function [b_best, a_best, a_best_scalar, warp_info] = design_with_warped_target( ...
+    design_fn, R_target, w_grid, order, fs, method_name)
+
+    % -------------------------
+    % baseline: a = 0
+    % -------------------------
+    [b0w, a0w] = design_fn(R_target, w_grid, order, fs);
+    [b0, a0] = apply_allpass_warp_to_iir(b0w, a0w, 0.0);
+
+    base_eval = evaluate_method(method_name, b0, a0, R_target, w_grid, fs);
+    base_score = combined_error_score(base_eval);
+
+    b_best = b0;
+    a_best = a0;
+    a_best_scalar = 0.0;
+    best_eval = base_eval;
+    best_score = base_score;
+
+    % -------------------------
+    % optimize a
+    % -------------------------
+    [a_try, score_try, b_try, a_try_tf, eval_try] = optimize_warp_parameter_binary( ...
+        design_fn, R_target, w_grid, order, fs, method_name);
+
+    if score_try < best_score
+        b_best = b_try;
+        a_best = a_try_tf;
+        a_best_scalar = a_try;
+        best_eval = eval_try;
+        best_score = score_try;
+    end
+
+    % -------------------------
+    % 汇总信息
+    % -------------------------
+    warp_info = struct();
+    warp_info.method = method_name;
+
+    warp_info.a_initial = 0.0;
+    warp_info.a_final   = a_best_scalar;
+
+    warp_info.score_initial = base_score;
+    warp_info.score_final   = best_score;
+    warp_info.score_drop    = base_score - best_score;
+    warp_info.score_drop_pct = 100 * (base_score - best_score) / max(base_score, 1e-12);
+
+    warp_info.rmse_db_initial = base_eval.rmse_db;
+    warp_info.rmse_db_final   = best_eval.rmse_db;
+    warp_info.rmse_db_drop    = base_eval.rmse_db - best_eval.rmse_db;
+    warp_info.rmse_db_drop_pct = 100 * (base_eval.rmse_db - best_eval.rmse_db) / max(base_eval.rmse_db, 1e-12);
+
+    warp_info.mse_initial = base_eval.mse_linear;
+    warp_info.mse_final   = best_eval.mse_linear;
+    warp_info.mse_drop    = base_eval.mse_linear - best_eval.mse_linear;
+    warp_info.mse_drop_pct = 100 * (base_eval.mse_linear - best_eval.mse_linear) / max(base_eval.mse_linear, 1e-20);
+end
+function [a_best, best_score, b_best, a_best_tf, best_eval] = optimize_warp_parameter_binary( ...
+    design_fn, R_target, w_grid, order, fs, method_name)
+
+    left = 0.0;
+    right = 0.92;
+    n_iter = 7;
+
+    a_best = 0.0;
+    best_score = inf;
+    b_best = [];
+    a_best_tf = [];
+    best_eval = [];
+
+    for it = 1:n_iter
+        m1 = left + 0.35 * (right - left);
+        m2 = left + 0.65 * (right - left);
+
+        [score1, b1, a1, eval1] = eval_one_warp_candidate(design_fn, R_target, w_grid, order, fs, method_name, m1);
+        [score2, b2, a2, eval2] = eval_one_warp_candidate(design_fn, R_target, w_grid, order, fs, method_name, m2);
+
+        if score1 < best_score
+            best_score = score1;
+            a_best = m1;
+            b_best = b1;
+            a_best_tf = a1;
+            best_eval = eval1;
+        end
+
+        if score2 < best_score
+            best_score = score2;
+            a_best = m2;
+            b_best = b2;
+            a_best_tf = a2;
+            best_eval = eval2;
+        end
+
+        if score1 <= score2
+            right = m2;
+        else
+            left = m1;
+        end
+    end
+
+    amid = 0.5 * (left + right);
+    [scorem, bm, am, evalm] = eval_one_warp_candidate(design_fn, R_target, w_grid, order, fs, method_name, amid);
+    if scorem < best_score
+        best_score = scorem;
+        a_best = amid;
+        b_best = bm;
+        a_best_tf = am;
+        best_eval = evalm;
+    end
+end
+function [score, b_final, a_final, eval_out] = eval_one_warp_candidate( ...
+    design_fn, R_target, w_grid, order, fs, method_name, awarp)
+
+    try
+        % 1) 用与最终结构替换一致的频率映射
+        [w_map, idx_sort] = warp_frequency_grid(w_grid, awarp);
+
+        % 2) 目标也必须按同一映射重排
+        R_warped = R_target(idx_sort);
+
+        % 3) 在 warped 频率轴上设计 G(z)
+        [b_warped, a_warped] = design_fn(R_warped, w_map, order, fs);
+
+        % 4) 再做结构级反扭曲：H(z)=G((a-z)/(1-az))
+        [b_final, a_final] = apply_allpass_warp_to_iir(b_warped, a_warped, awarp);
+
+        % 5) 回到原始目标上评估
+        eval_out = evaluate_method(sprintf('%s(a=%.4f)', method_name, awarp), ...
+            b_final, a_final, R_target, w_grid, fs);
+
+        score = combined_error_score(eval_out);
+
+        if ~isfinite(score)
+            score = inf;
+        end
+    catch
+        score = inf;
+        b_final = [];
+        a_final = [];
+        eval_out = [];
+    end
+end
+
+function s = combined_error_score(out)
+    s = out.rmse_db ...
+      + 0.15 * out.max_db_abs ...
+      + 0.02 * sqrt(out.mse_linear);
+
+    if ~out.is_stable
+        s = s + 1e3;
+    end
+
+    if out.max_pole_radius >= 0.9995
+        s = s + 50;
+    end
+end
+function [w_map_sorted, idx_sort] = warp_frequency_grid(w_grid, a)
+    % 与最终结构替换完全一致的映射：
+    % z2 = (a - z) / (1 - a z), z = e^{jw}
+    %
+    % 这个映射会把 w=0 映到 w2=pi，把 w=pi 映到 w2=0，
+    % 也就是“低频 -> 高频”。
+    %
+    % 由于多数设计函数要求频率轴单调递增，
+    % 所以这里把映射后的频率排序，并返回排序下标。
+
+    z = exp(1j * w_grid(:));
+    z2 = (a - z) ./ (1 - a * z);
+
+    % z2 在单位圆上，频率取 [0, pi]
+    % 用 acos(real(z2)) 比 angle 更稳，且天然落在 [0, pi]
+    w_map = acos(max(-1, min(1, real(z2))));
+
+    % 排序成升序，供 design_fn 使用
+    [w_map_sorted, idx_sort] = sort(w_map, 'ascend');
+
+    % 避免重复点/非严格单调
+    for k = 2:length(w_map_sorted)
+        if w_map_sorted(k) <= w_map_sorted(k-1)
+            w_map_sorted(k) = min(pi, w_map_sorted(k-1) + 1e-12);
+        end
+    end
+end
+
+function [b_out, a_out] = apply_allpass_warp_to_iir(b_in, a_in, a)
+    % 将设计域滤波器 G(z) 变成 H(z) = G((a-z)/(1-az))
+    % 在 q = z^-1 多项式域下：
+    % q2 = (a - q) / (1 - a q)
+
+    b_in = real_if_close(b_in(:).');
+    a_in = real_if_close(a_in(:).');
+
+    Mb = length(b_in) - 1;
+    Ma = length(a_in) - 1;
+    L = max(Mb, Ma);
+
+    b_pad = [b_in, zeros(1, L - Mb)];
+    a_pad = [a_in, zeros(1, L - Ma)];
+
+    % q2 = (a - q)/(1 - a q)
+    p_num = [a, -1];   % a - q
+    p_den = [1, -a];   % 1 - a q
+
+    num_acc = 0;
+    den_acc = 0;
+
+    for k = 0:L
+        term_num = poly_power_asc(p_num, k);
+        term_den = poly_power_asc(p_den, L-k);
+        term = conv(term_num, term_den);
+
+        num_acc = poly_add_asc(num_acc, b_pad(k+1) * term);
+        den_acc = poly_add_asc(den_acc, a_pad(k+1) * term);
+    end
+
+    b_out = real_if_close(num_acc);
+    a_out = real_if_close(den_acc);
+
+    % 归一化
+    if abs(a_out(1)) < 1e-14
+        error('Warped denominator leading coefficient is too small.');
+    end
+
+    b_out = b_out / a_out(1);
+    a_out = a_out / a_out(1);
+
+    a_out = stabilize_a(a_out);
+
+    % 再做一次实数化
+    b_out = real_if_close(b_out);
+    a_out = real_if_close(a_out);
+end
+
+function p = poly_power_asc(base, n)
+    % base 用“升幂”表示：c0 + c1 q + c2 q^2 + ...
+    if n == 0
+        p = 1;
+        return;
+    end
+
+    p = 1;
+    for k = 1:n
+        p = conv(p, base);
+    end
+end
+
+function c = poly_add_asc(a, b)
+    if isequal(a, 0), c = b; return; end
+    if isequal(b, 0), c = a; return; end
+
+    la = length(a);
+    lb = length(b);
+    L = max(la, lb);
+
+    aa = [a, zeros(1, L-la)];
+    bb = [b, zeros(1, L-lb)];
+
+    c = aa + bb;
+end
+
+function x = real_if_close(x)
+    if max(abs(imag(x))) < 1e-10 * max(1, max(abs(real(x))))
+        x = real(x);
+    end
 end
