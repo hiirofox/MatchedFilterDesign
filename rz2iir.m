@@ -13,7 +13,7 @@ function compare_matched_iir_methods()
     w_grid = logspace(log10(w_min), log10(pi), num_points)';   % rad/sample
     freqs = w_grid * fs / (2 * pi);                            % Hz
 
-    order = 6;
+    order = 4;
 
     %% =========================
     % 1. 定义模拟目标幅度
@@ -21,7 +21,7 @@ function compare_matched_iir_methods()
     fc = 230;
     wc = 2 * pi * fc;
     Q = 2;
-    stages = 6;
+    stages = 2;
 
     s = 1j * 2 * pi * freqs;
     
@@ -1111,9 +1111,9 @@ end
 function [a_best, best_score, b_best, a_best_tf, best_eval] = optimize_warp_parameter_binary2( ...
     design_fn, R_target, w_grid, order, fs, method_name)
 
-    left = -0.99;
-    right = 0.99;
-    n_iter = 7;
+    left = -1.99;
+    right = 1.99;
+    n_iter = 70;
 
     a_best = 0.0;
     best_score = inf;
@@ -1166,39 +1166,43 @@ function [a_best, best_score, b_best, a_best_tf, best_eval] = optimize_warp_para
     design_fn, R_target, w_grid, order, fs, method_name)
 
     % ============================================================
-    % Extreme warp-parameter optimizer
+    % Mesh search for warp parameter a
     %
-    % Strategy:
-    %   1) Search in u-space, with a = tanh(u)
-    %   2) Coarse structured scan in u-space
-    %   3) Pick best local basin
-    %   4) Golden-section refinement in u-space
-    %   5) Small local polish around the best point
+    % Stage 1:
+    %   Uniformly sample n points in [a_min, a_max]
     %
-    % Designed for:
-    %   - expensive eval_one_warp_candidate(...)
-    %   - noisy / mildly multi-modal score(a)
-    %   - a in (-1, 1), with strong edge sensitivity near +-1
+    % Stage 2:
+    %   Find the best sampled point, then refine inside one adjacent interval
+    %   around that point using m points
     %
-    % Typical eval count:
-    %   around 14 ~ 20, configurable below
+    % Stage 3:
+    %   Run local interval shrink ("binary"/ternary-like) in that refined interval
+    %
+    % Notes:
+    %   - lower score is better
+    %   - cache is used to avoid duplicate expensive evaluations
     % ============================================================
 
-    % ---- search settings ----
-    max_evals      = 20;     % total expensive eval budget
-    u_bound        = 10;    % tanh(2.8) ~= 0.9926
-    golden_iters   = 10;     % refinement iterations (1 eval / iter max)
-    do_final_polish = true;  % 2 extra local checks if budget allows
+    % ---------- user-tunable parameters ----------
+    a_min = -1.99;
+    a_max =  1.99;
 
-    % ---- outputs ----
+    n_coarse = 30;     % first-stage global mesh
+    m_fine   = 30;     % second-stage local mesh
+    n_local_iter = 24; % final local shrink iterations
+
+    % local shrink probe positions inside interval
+    r1 = 0.35;
+    r2 = 0.65;
+
+    % ---------- outputs ----------
     a_best = 0.0;
     best_score = inf;
     b_best = [];
     a_best_tf = [];
     best_eval = [];
 
-    % ---- cache ----
-    u_cache = [];
+    % ---------- cache ----------
     a_cache = [];
     f_cache = [];
     b_cache = {};
@@ -1206,43 +1210,40 @@ function [a_best, best_score, b_best, a_best_tf, best_eval] = optimize_warp_para
     eval_cache = {};
 
     % ============================================================
-    % cached evaluator in u-space
+    % cached evaluator
     % ============================================================
-    function [f, b_cur, a_tf_cur, eval_cur, a_cur] = eval_cached_u(u)
-        % clamp u to search range
-        u = max(min(u, u_bound), -u_bound);
-        a_cur = tanh(u);
+    function [f, b_cur, a_tf_cur, eval_cur] = eval_cached(a_try)
+        % clamp
+        a_try = max(min(a_try, a_max), a_min);
 
-        % reuse cached result if same u already evaluated
-        if ~isempty(u_cache)
-            idx = find(abs(u_cache - u) <= 1e-14, 1);
+        % reuse if already evaluated
+        if ~isempty(a_cache)
+            idx = find(abs(a_cache - a_try) <= 1e-14, 1);
             if ~isempty(idx)
                 f        = f_cache(idx);
                 b_cur    = b_cache{idx};
                 a_tf_cur = atf_cache{idx};
                 eval_cur = eval_cache{idx};
-                a_cur    = a_cache(idx);
                 return;
             end
         end
 
         [f, b_cur, a_tf_cur, eval_cur] = eval_one_warp_candidate( ...
-            design_fn, R_target, w_grid, order, fs, method_name, a_cur);
+            design_fn, R_target, w_grid, order, fs, method_name, a_try);
 
         if ~isfinite(f)
             f = inf;
         end
 
-        u_cache(end+1)       = u;
-        a_cache(end+1)       = a_cur;
-        f_cache(end+1)       = f;
-        b_cache{end+1}       = b_cur;
-        atf_cache{end+1}     = a_tf_cur;
-        eval_cache{end+1}    = eval_cur;
+        a_cache(end+1)    = a_try;
+        f_cache(end+1)    = f;
+        b_cache{end+1}    = b_cur;
+        atf_cache{end+1}  = a_tf_cur;
+        eval_cache{end+1} = eval_cur;
 
         if f < best_score
             best_score = f;
-            a_best = a_cur;
+            a_best = a_try;
             b_best = b_cur;
             a_best_tf = a_tf_cur;
             best_eval = eval_cur;
@@ -1250,138 +1251,83 @@ function [a_best, best_score, b_best, a_best_tf, best_eval] = optimize_warp_para
     end
 
     % ============================================================
-    % helper: count evals
+    % Stage 1: coarse global mesh
     % ============================================================
-    function n = n_evals()
-        n = numel(f_cache);
+    A1 = linspace(a_min, a_max, n_coarse);
+    F1 = inf(size(A1));
+
+    for k = 1:numel(A1)
+        [F1(k), ~, ~, ~] = eval_cached(A1(k));
     end
 
-    % ============================================================
-    % 1) coarse structured scan in u-space
-    %
-    % symmetric but stretched enough to touch near-edge behavior
-    %   u = [-2.0, -0.6, 0, 0.6, 2.0]
-    %   a = [-0.964, -0.537, 0, 0.537, 0.964]
-    % ============================================================
-    u0 = [-2.0, -0.6, 0.0, 0.6, 2.0];
-    f0 = inf(size(u0));
+    % best coarse point
+    [~, idx1] = min(F1);
 
-    for k = 1:numel(u0)
-        if n_evals() >= max_evals
-            return;
-        end
-        [f0(k), ~, ~, ~, ~] = eval_cached_u(u0(k));
-    end
-
-    % ============================================================
-    % 2) choose a basin to refine
-    %
-    % We want a bracket [ul, ur] around a promising local region.
-    % If best point is at the edge, we add one more point outward/inward
-    % to avoid refining a bad boundary artifact.
-    % ============================================================
-    [~, idx_best0] = min(f0);
-
-    if idx_best0 == 1
-        % best at left edge: add one point between u0(1) and u0(2)
-        u_extra = 0.5 * (u0(1) + u0(2));
-        if n_evals() < max_evals
-            [f_extra, ~, ~, ~, ~] = eval_cached_u(u_extra);
-            if f_extra < f0(1)
-                ul = -u_bound;
-                ur = u0(2);
-            else
-                ul = u0(1);
-                ur = u0(2);
-            end
-        else
-            ul = u0(1);
-            ur = u0(2);
-        end
-
-    elseif idx_best0 == numel(u0)
-        % best at right edge: add one point between u0(end-1) and u0(end)
-        u_extra = 0.5 * (u0(end-1) + u0(end));
-        if n_evals() < max_evals
-            [f_extra, ~, ~, ~, ~] = eval_cached_u(u_extra);
-            if f_extra < f0(end)
-                ul = u0(end-1);
-                ur = u_bound;
-            else
-                ul = u0(end-1);
-                ur = u0(end);
-            end
-        else
-            ul = u0(end-1);
-            ur = u0(end);
-        end
-
+    % choose one adjacent interval around the best coarse point
+    if idx1 == 1
+        left1  = A1(1);
+        right1 = A1(2);
+    elseif idx1 == numel(A1)
+        left1  = A1(end-1);
+        right1 = A1(end);
     else
-        % interior best: use its two neighbors as the initial bracket
-        ul = u0(idx_best0 - 1);
-        ur = u0(idx_best0 + 1);
-    end
-
-    % ============================================================
-    % 3) golden-section refinement in u-space
-    %
-    % robust for noisy objectives, 1 new eval per loop
-    % ============================================================
-    phi = (sqrt(5) - 1) / 2;   % 0.618...
-    x1 = ur - phi * (ur - ul);
-    x2 = ul + phi * (ur - ul);
-
-    [f1, ~, ~, ~, ~] = eval_cached_u(x1);
-    if n_evals() < max_evals
-        [f2, ~, ~, ~, ~] = eval_cached_u(x2);
-    else
-        return;
-    end
-
-    for it = 1:golden_iters
-        if n_evals() >= max_evals
-            break;
-        end
-
-        if f1 <= f2
-            ur = x2;
-            x2 = x1;
-            f2 = f1;
-
-            x1 = ur - phi * (ur - ul);
-            [f1, ~, ~, ~, ~] = eval_cached_u(x1);
+        % compare left and right adjacent intervals using neighbor scores
+        if F1(idx1-1) <= F1(idx1+1)
+            left1  = A1(idx1-1);
+            right1 = A1(idx1);
         else
-            ul = x1;
-            x1 = x2;
-            f1 = f2;
-
-            x2 = ul + phi * (ur - ul);
-            [f2, ~, ~, ~, ~] = eval_cached_u(x2);
+            left1  = A1(idx1);
+            right1 = A1(idx1+1);
         end
     end
 
     % ============================================================
-    % 4) optional local polish around current best in u-space
-    %
-    % this helps when best point lies on a shallow noisy plateau
+    % Stage 2: fine mesh inside selected interval
     % ============================================================
-    if do_final_polish && n_evals() < max_evals
-        % locate the current best u in cache
-        [~, idxg] = min(f_cache);
-        u_star = u_cache(idxg);
+    A2 = linspace(left1, right1, m_fine);
+    F2 = inf(size(A2));
 
-        % local step based on current bracket width
-        du = 0.15 * max(ur - ul, 0.05);
+    for k = 1:numel(A2)
+        [F2(k), ~, ~, ~] = eval_cached(A2(k));
+    end
 
-        if n_evals() < max_evals
-            eval_cached_u(u_star - du);
-        end
-        if n_evals() < max_evals
-            eval_cached_u(u_star + du);
+    [~, idx2] = min(F2);
+
+    % choose local interval around best fine point
+    if idx2 == 1
+        left2  = A2(1);
+        right2 = A2(2);
+    elseif idx2 == numel(A2)
+        left2  = A2(end-1);
+        right2 = A2(end);
+    else
+        left2  = A2(idx2-1);
+        right2 = A2(idx2+1);
+    end
+
+    % ============================================================
+    % Stage 3: local interval shrink
+    % ============================================================
+    left = left2;
+    right = right2;
+
+    for it = 1:n_local_iter
+        m1 = left + r1 * (right - left);
+        m2 = left + r2 * (right - left);
+
+        [score1, ~, ~, ~] = eval_cached(m1);
+        [score2, ~, ~, ~] = eval_cached(m2);
+
+        if score1 <= score2
+            right = m2;
+        else
+            left = m1;
         end
     end
 
-    % done: global best already tracked in cache
+    % final midpoint check
+    amid = 0.5 * (left + right);
+    eval_cached(amid);
 end
 %%%%%%%%%%%%%%%%%%%%%%
 function [score, b_final, a_final, eval_out] = eval_one_warp_candidate( ...
@@ -1425,33 +1371,146 @@ function out = evaluate_method(name, b, a, R_target, w_grid, fs)
     h = freqz(b, a, w_grid);
     mag = abs(h);
 
+    eps_mag = 1e-12;
+
+    mag_db_target = 20*log10(mag_target + eps_mag);
+    mag_db = 20*log10(mag + eps_mag);
+
     err_lin = mag - mag_target;
-    err_db  = 20*log10(mag + 1e-15) - 20*log10(mag_target + 1e-15);
+    err_db  = mag_db - mag_db_target;
 
+    % ------------------------------------------------------------
+    % Visual-focus weighting:
+    % emphasize target magnitude above -40 dB
+    % ------------------------------------------------------------
+    db_focus = -40;   % focus threshold
+    db_soft  = 4;     % softness around threshold
+    w_floor  = 0.08;  % minimum weight below threshold
+
+    w_vis = w_floor + (1 - w_floor) ./ ...
+        (1 + exp(-(mag_db_target - db_focus)/db_soft));
+
+    w_vis = w_vis(:);
+    w_vis = w_vis / mean(w_vis);   % normalize average weight to ~1
+
+    % log-frequency axis
+    w_safe = max(w_grid(:), 1e-9);
+    xlog = log(w_safe);
+
+    % derivatives on log-frequency axis
+    d_tar = gradient(mag_db_target(:), xlog);
+    d_fit = gradient(mag_db(:), xlog);
+    derr1 = d_fit - d_tar;
+
+    dd_tar = gradient(d_tar, xlog);
+    dd_fit = gradient(d_fit, xlog);
+    derr2 = dd_fit - dd_tar;
+
+    % poles
     p = roots(a);
+    pole_radius = abs(p);
 
+    % store basics
     out.name = name;
     out.b = b;
     out.a = a;
+
+    out.err_db = err_db(:);
+    out.err_lin = err_lin(:);
+    out.mag_db = mag_db(:);
+    out.mag_db_target = mag_db_target(:);
+    out.w_vis = w_vis;
+
+    % ------------------------------------------------------------
+    % weighted error metrics
+    % ------------------------------------------------------------
     out.mse_linear = mean(err_lin.^2);
+    out.rmse_linear = sqrt(out.mse_linear);
+
+    out.wrmse_db = sqrt(sum(w_vis .* (err_db(:).^2)) / sum(w_vis));
+    out.wrmse_lin = sqrt(sum(w_vis .* (err_lin(:).^2)) / sum(w_vis));
+
+    % unweighted versions kept for reference
     out.rmse_db = sqrt(mean(err_db.^2));
     out.max_db_abs = max(abs(err_db));
-    out.max_pole_radius = max(abs(p));
-    out.is_stable = all(abs(p) < 1 - 1e-10);
+
+    % weighted slope / curvature
+    out.wrmse_slope_db = sqrt(sum(w_vis .* (derr1.^2)) / sum(w_vis));
+    out.wrmse_curv_db  = sqrt(sum(w_vis .* (derr2.^2)) / sum(w_vis));
+
+    % roughness of fitted curve
+    out.roughness_db = sqrt(sum(w_vis .* (dd_fit.^2)) / sum(w_vis));
+
+    % ------------------------------------------------------------
+    % percentile-like stats only in visually relevant region
+    % ------------------------------------------------------------
+    idx_vis = (mag_db_target >= -40);
+
+    if any(idx_vis)
+        e_vis = abs(err_db(idx_vis));
+        out.p95_db_abs_vis = prctile(e_vis, 95);
+        out.p98_db_abs_vis = prctile(e_vis, 98);
+        out.max_db_abs_vis = max(e_vis);
+    else
+        e_all = abs(err_db);
+        out.p95_db_abs_vis = prctile(e_all, 95);
+        out.p98_db_abs_vis = prctile(e_all, 98);
+        out.max_db_abs_vis = max(e_all);
+    end
+
+    % ------------------------------------------------------------
+    % anchor errors in visually meaningful places
+    % ------------------------------------------------------------
+    n = numel(w_grid);
+
+    idx_lo = max(1, round(0.08 * n));
+    idx_hi = max(1, round(0.92 * n));
+
+    [~, idx_peak_tar] = max(mag_db_target);
+
+    out.anchor_lo_db   = abs(err_db(idx_lo));
+    out.anchor_peak_db = abs(err_db(idx_peak_tar));
+    out.anchor_hi_db   = abs(err_db(idx_hi));
+
+    % stability
+    out.max_pole_radius = max(pole_radius);
+    out.is_stable = all(pole_radius < 1 - 1e-10);
 
     [out.h_plot, out.f_plot] = freqz(b, a, 4096, fs);
 end
-function s = combined_error_score(out)
-    s = out.rmse_db ...
-      + 0.15 * out.max_db_abs ...
-      + 0.02 * sqrt(out.mse_linear);
+function s = combined_error_score(out, a_warp)
+    % Main fit score: prioritize visually relevant region
+    s = 1.00 * out.wrmse_db ...
+      + 0.30 * out.p95_db_abs_vis ...
+      + 0.12 * out.wrmse_lin ...
+      + 0.16 * out.wrmse_slope_db ...
+      + 0.04 * out.wrmse_curv_db;
 
+    % Anchors
+    s = s ...
+      + 0.10 * out.anchor_lo_db ...
+      + 0.16 * out.anchor_peak_db ...
+      + 0.10 * out.anchor_hi_db;
+
+    % Stability
     if ~out.is_stable
         s = s + 1e3;
+        return;
     end
 
+    % Pole radius soft penalty
     if out.max_pole_radius >= 0.9995
         s = s + 50;
+    elseif out.max_pole_radius >= 0.9990
+        s = s + 15;
+    elseif out.max_pole_radius >= 0.9985
+        s = s + 5;
+    end
+
+    % Warp-edge soft penalty
+    if nargin >= 2 && ~isempty(a_warp)
+        excess = max(0, abs(a_warp) - 0.90);
+        s = s + 40 * excess.^2;
     end
 end
 
