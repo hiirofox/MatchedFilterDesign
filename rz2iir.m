@@ -1,209 +1,1031 @@
-function [b_final, a_final] = design_matched_iir_spectral(R_target, w_grid, order)
-    % 输入:
-    %   R_target : 目标能量响应 |H(w)|^2
-    %   w_grid   : 数字角频率网格 [0, pi]
-    %   order    : IIR 阶数 (建议 4)
+function compare_matched_iir_methods()
+    clc; close all;
+
+    %% =========================
+    % 0. 测试目标
+    % ==========================
+    fs = 48000;
+    num_points = 8192;
+
+    f_min = 70.0;
+    w_min = 2 * pi * f_min / fs;
+    w_grid = logspace(log10(w_min), log10(pi), num_points)';   % rad/sample
+    freqs = w_grid * fs / (2 * pi);                            % Hz
+
+    order = 6;
+
+    %% =========================
+    % 1. 定义模拟目标幅度
+    % ==========================
+    fc = 1600;
+    wc = 2 * pi * fc;
+    Q = 2;
+    stages = 6;
+
+    s = 1j * 2 * pi * freqs;
     
+    A_target = 2;
+    Hs_peaking = @(s) (1 + (A_target - 1) * ...
+        (1 ./ (1 + (abs((imag(s).^2 - wc^2) ./ (wc/Q * imag(s) + 1e-200))).^(2*stages))));
+
+    if Q > 1/sqrt(2)
+        peak_factor = 1 - 1 / (2 * Q^2);
+    else
+        peak_factor = 1.0;
+    end
+
+    wc_comp = wc * (peak_factor)^(0.5 - 1 / (2 * stages));
+
+    Hs_lowpass = @(s) (1 ./ ( (1 - (abs(imag(s))/wc_comp).^(2*stages)) + ...
+        1j * ((abs(imag(s))/wc_comp).^stages / Q) ));
+
+    % 你可以切换目标
+    Hs_obj = Hs_peaking(s);
+    mag_target = abs(Hs_obj);
+    R_target = mag_target.^2;
+
+    %% =========================
+    % 2. 设计多个版本
+    % ==========================
+    methods = {};
+    results = struct([]);
+
+    % ---- 方法 1: 你的谱分解 IRLS ----
+    [b1, a1] = design_matched_iir_spectral(R_target, w_grid, order);
+    methods{end+1} = 'spectral-irls';
+    tmp = evaluate_method(methods{end}, b1, a1, R_target, w_grid, fs);
+    if isempty(results)
+       results = tmp;
+    else
+        results(end+1) = tmp;
+    end
+
+    % ---- 方法 2: 最小相位 + invfreqz ----
+    [b2, a2] = design_matched_iir_invfreqz(R_target, w_grid, order);
+    methods{end+1} = 'minphase-invfreqz';
+    tmp = evaluate_method(methods{end}, b2, a2, R_target, w_grid, fs);
+    if isempty(results)
+       results = tmp;
+    else
+        results(end+1) = tmp;
+    end
+
+
+    % ---- 方法 2b: 最小相位恢复 + prony ----
+    
+    try
+        [b2b, a2b] = design_matched_iir_prony_minphase(R_target, w_grid, order);
+        methods{end+1} = 'minphase-prony';
+        results(end+1) = evaluate_method(methods{end}, b2b, a2b, R_target, w_grid, fs);
+    catch ME
+        warning('minphase-prony failed: %s', ME.message);
+    end
+    
+    % ---- 方法 2c: 最小相位恢复 + stmcb ----
+    try
+        [b2c, a2c] = design_matched_iir_stmcb_minphase(R_target, w_grid, order);
+        methods{end+1} = 'minphase-stmcb';
+        results(end+1) = evaluate_method(methods{end}, b2c, a2c, R_target, w_grid, fs);
+    catch ME
+        warning('minphase-stmcb failed: %s', ME.message);
+    end
+
+    % ---- 方法 3: yulewalk ----
+    try
+        [b3, a3] = design_matched_iir_yulewalk(R_target, w_grid, order);
+        methods{end+1} = 'yulewalk-stmcb';
+        tmp = evaluate_method(methods{end}, b3, a3, R_target, w_grid, fs);
+        if isempty(results)
+           results = tmp;
+        else
+            results(end+1) = tmp;
+        end
+    catch ME
+        warning('yulewalk failed: %s', ME.message);
+    end
+
+    % ---- 方法 4: iirlpnorm ----
+    try
+        [b4, a4] = design_matched_iir_iirlpnorm(R_target, w_grid, order);
+        methods{end+1} = 'iirlpnorm';
+        tmp = evaluate_method(methods{end}, b4, a4, R_target, w_grid, fs);
+        if isempty(results)
+           results = tmp;
+        else
+            results(end+1) = tmp;
+        end
+    catch ME
+        warning('iirlpnorm failed (maybe DSP System Toolbox missing): %s', ME.message);
+    end
+
+    % ---- 方法 5: analog invfreqs + matched discretization ----
+    try
+        [b5, a5] = design_matched_iir_analog_matched(R_target, w_grid, order, fs);
+        methods{end+1} = 'analog-invfreqs-matched';
+        tmp = evaluate_method(methods{end}, b5, a5, R_target, w_grid, fs);
+        if isempty(results)
+           results = tmp;
+        else
+            results(end+1) = tmp;
+        end
+    catch ME
+        warning('analog matched failed (maybe Control/System ID related capability missing): %s', ME.message);
+    end
+
+    %% =========================
+    % 3. 打印结果表
+    % ==========================
+    fprintf('\n==================== comparison ====================\n');
+    fprintf('%-24s | %-12s | %-12s | %-12s | %-10s | %-8s\n', ...
+        'method', 'lin-MSE', 'dB-RMSE', 'max|dB|', 'max|p|', 'stable');
+    fprintf('%s\n', repmat('-', 1, 92));
+
+    for k = 1:numel(results)
+        fprintf('%-24s | %-12.4e | %-12.4e | %-12.4e | %-10.6f | %-8d\n', ...
+            results(k).name, results(k).mse_linear, results(k).rmse_db, ...
+            results(k).max_db_abs, results(k).max_pole_radius, results(k).is_stable);
+    end
+
+    % 找最优
+    [~, idx_best_mse] = min([results.mse_linear]);
+    [~, idx_best_db ] = min([results.rmse_db]);
+
+    fprintf('\nBest by linear MSE : %s\n', results(idx_best_mse).name);
+    fprintf('Best by dB RMSE    : %s\n', results(idx_best_db).name);
+
+    %% =========================
+    % 4. 绘图
+    % ==========================
+    figure('Name', 'Magnitude response compare');
+    semilogx(freqs, 20*log10(mag_target + 1e-15), 'k--', 'LineWidth', 2); hold on;
+
+    legends = {'Analog Prototype'};
+    for k = 1:numel(results)
+        [h, fplot] = freqz(results(k).b, results(k).a, 16384, fs);
+        semilogx(fplot, 20*log10(abs(h) + 1e-15), 'LineWidth', 1.3);
+        legends{end+1} = results(k).name; %#ok<AGROW>
+    end
+    grid on;
+    xlim([100, 24000]);
+    ylim([-40, 20]);
+    xlabel('Frequency (Hz)');
+    ylabel('Magnitude (dB)');
+    title('4th-order IIR fitting comparison');
+    legend(legends, 'Location', 'best');
+
+    % 误差图
+    figure('Name', 'Magnitude error compare');
+    for k = 1:numel(results)
+        [h, ~] = freqz(results(k).b, results(k).a, w_grid);
+        err_db = 20*log10(abs(h) + 1e-15) - 20*log10(sqrt(R_target) + 1e-15);
+        semilogx(freqs, err_db, 'LineWidth', 1.2); hold on;
+    end
+    yline(0, 'k--');
+    grid on;
+    xlim([100, 24000]);
+    xlabel('Frequency (Hz)');
+    ylabel('Error (dB)');
+    title('Magnitude error vs target');
+    legend(methods, 'Location', 'best');
+
+    % 极点零点图
+    figure('Name', 'Pole-zero maps');
+    nshow = numel(results);
+    nrow = ceil(nshow / 2);
+    for k = 1:nshow
+        subplot(nrow, 2, k);
+        zplane(results(k).b, results(k).a);
+        title(results(k).name);
+    end
+end
+
+%% ============================================================
+% 方法 1：你的谱分解 IRLS
+% =============================================================
+function [b_final, a_final] = design_matched_iir_spectral(R_target, w_grid, order)
     N = order;
     num_points = length(w_grid);
-    
-    % === 迭代重加权最小二乘拟合 (IRLS) ===
-    num_iters = 6;
+
+    num_iters = 8;
     W = ones(num_points, 1);
-    
+
     for iter = 1:num_iters
-        % 构造基函数矩阵 A
-        % 目标方程: |H|^2 * Q(cos) = P(cos)
-        % 其中 P 和 Q 是余弦多项式
         A = zeros(num_points, 2*N + 1);
-        A(:, 1) = W * 1.0; % P0
-        
+        A(:, 1) = W;
+
         for k = 1:N
-            A(:, k+1) = W .* cos(k * w_grid);         % P_k 基
-            A(:, k+N+1) = -W .* R_target .* cos(k * w_grid); % Q_k 基
+            A(:, k+1)     = W .* cos(k * w_grid);
+            A(:, k+N+1)   = -W .* R_target .* cos(k * w_grid);
         end
-        
-        b_vec = W .* R_target;
-        
-        % 使用 MATLAB 强大的左除算子 (\) 求解线性方程组
-        % 它内部会自动进行 QR 或 SVD 分解来应对病态矩阵
-        x = A \ b_vec;
-        
-        % 更新权重以提高拟合精度
+
+        rhs = W .* R_target;
+        x = A \ rhs;
+
         d_temp = [1; x(N+2 : 2*N+1)];
-        Q_vals = d_temp(1);
+        Q_vals = d_temp(1) * ones(size(w_grid));
         for k = 1:N
             Q_vals = Q_vals + d_temp(k+1) * cos(k * w_grid);
         end
-        W = 1.0 ./ (abs(Q_vals) + 1e-6);
+
+        % 可改成更 aggressive 的重加权
+        W = 1 ./ max(abs(Q_vals), 1e-6);
+        W = W / mean(W);
     end
-    
-    c = x(1 : N+1);        % 分子余弦多项式系数
-    d = [1; x(N+2 : end)]; % 分母余弦多项式系数
-    
-    % === 执行谱分解提取稳定解 ===
+
+    c = x(1 : N+1);
+    d = [1; x(N+2 : end)];
+
     b_unscaled = spectral_factorization(c);
-    a_final = spectral_factorization(d);
+    a_final    = spectral_factorization(d);
+    a_final    = stabilize_a(a_final);
+
+    b_final = calibrate_gain(b_unscaled, a_final, sqrt(R_target), w_grid);
     
-    % === 增益校准 (平均线性增益补偿) ===
-    [h_unscaled, ~] = freqz(b_unscaled, a_final, w_grid);
-    mean_mag_target = mean(sqrt(R_target));
-    mean_mag_digital = mean(abs(h_unscaled));
-    
-    gain_correction = mean_mag_target / (mean_mag_digital + 1e-12);
-    b_final = b_unscaled * gain_correction;
 end
 
 function factor_poly = spectral_factorization(coeffs)
-    % 对余弦多项式进行谱分解以提取 Z 域稳定根
     N = length(coeffs) - 1;
     poly_z = zeros(2*N + 1, 1);
-    
-    % 将 cos(kw) 转换为 (z^k + z^-k)/2
-    poly_z(N + 1) = coeffs(1); % 常数项
+
+    poly_z(N + 1) = coeffs(1);
     for k = 1:N
-        poly_z(N + 1 - k) = coeffs(k+1) / 2.0;
-        poly_z(N + 1 + k) = coeffs(k+1) / 2.0;
+        poly_z(N + 1 - k) = coeffs(k+1) / 2;
+        poly_z(N + 1 + k) = coeffs(k+1) / 2;
     end
-    
-    % 求根
+
     r = roots(poly_z);
-    
-    % 关键：选择单位圆内的根（最小相位性质，保证稳定性）
-    % 过滤掉幅度接近 0 的数值噪声
-    r = r(abs(r) < 1.0 | abs(abs(r) - 1.0) < 1e-10);
-    
-    % 按照与单位圆的距离排序，取最里面的 N 个根
-    [~, idx] = sort(abs(r));
-    selected_roots = r(idx(1:N));
-    
-    % 从根还原多项式系数
-    factor_poly = real(poly(selected_roots));
+
+    % 对单位圆外根做镜像，优先构造最小相位/稳定因子
+    selected = [];
+    used = false(size(r));
+    tol = 1e-7;
+
+    for i = 1:length(r)
+        if used(i), continue; end
+        ri = r(i);
+
+        if abs(abs(ri) - 1) < tol
+            selected(end+1,1) = ri; %#ok<AGROW>
+            used(i) = true;
+            continue;
+        end
+
+        target = 1 / conj(ri);
+        j = find(~used & abs(r - target) < 1e-4, 1);
+
+        if isempty(j)
+            if abs(ri) < 1
+                selected(end+1,1) = ri; %#ok<AGROW>
+            else
+                selected(end+1,1) = 1 / conj(ri); %#ok<AGROW>
+            end
+            used(i) = true;
+        else
+            if abs(ri) <= 1
+                selected(end+1,1) = ri; %#ok<AGROW>
+            else
+                selected(end+1,1) = r(j); %#ok<AGROW>
+            end
+            used([i j]) = true;
+        end
+    end
+
+    if numel(selected) < N
+        [~, idx] = sort(abs(r));
+        selected = r(idx(1:N));
+    elseif numel(selected) > N
+        [~, idx] = sort(abs(selected));
+        selected = selected(idx(1:N));
+    end
+
+    factor_poly = real(poly(selected(:).'));
+    factor_poly = factor_poly / factor_poly(1);
 end
 
-
+%% ============================================================
+% 方法 2：最小相位恢复 + invfreqz
+% =============================================================
 function [b, a] = design_matched_iir_invfreqz(R_target, w_grid, order)
-    % 1. 还原幅度
-    mag_target = sqrt(abs(R_target));
-    
-    % 2. 使用“超级长窗”重建相位，彻底干掉倒谱混叠
-    % 既然是 48k 采样且有高 Q 峰值，我们将 FFT 点数拉高到 65536 或更高
-    n_fft = max(65536*16, 2^nextpow2(length(w_grid) * 8)); 
-    
-    % 将幅度插值到线性频率轴进行 FFT (hilbert 的前提是等间距采样)
+    mag_target = sqrt(max(R_target, 0));
+
+    H_min = reconstruct_minphase_from_mag(mag_target, w_grid);
+
+    wt = build_weight_curve(mag_target, w_grid);
+    [b, a] = invfreqz(H_min, w_grid, order, order, wt, 50);
+
+    a = stabilize_a(a);
+    b = calibrate_gain(b, a, mag_target, w_grid);
+end
+
+function H_min = reconstruct_minphase_from_mag(mag_target, w_grid)
+    mag_target = mag_target(:);
+    w_grid = w_grid(:);
+
+    n_fft = max(2^18, 2^nextpow2(length(w_grid) * 16));
+
     w_linear = linspace(0, pi, n_fft/2 + 1)';
-    mag_linear = interp1(w_grid, mag_target, w_linear, 'pchip', mag_target(end));
-    
-    % 构造对称的对数幅度谱
-    log_mag_spec = [log(mag_linear + 1e-20); log(mag_linear(end-1:-1:2) + 1e-20)];
-    
-    % 计算倒谱 (Cepstrum)
+    mag_linear = interp1(w_grid, mag_target, w_linear, 'pchip', 'extrap');
+    mag_linear = max(mag_linear, 1e-12);
+
+    log_mag_spec = [log(mag_linear); log(mag_linear(end-1:-1:2))];
     cep = ifft(log_mag_spec, 'symmetric');
-    
-    % 施加因果窗：保留正时间部分，消除混叠干扰
-    win = [1; 2*ones(n_fft/2-1, 1); 1; zeros(n_fft/2-1, 1)];
+
+    win = [1; 2*ones(n_fft/2-1,1); 1; zeros(n_fft/2-1,1)];
     min_phase_spec = exp(fft(cep .* win));
-    
-    % 提取回前半段复频响，并插值回原始 w_grid
-    Hs_full = min_phase_spec(1:n_fft/2+1);
-    Hs_complex = interp1(w_linear, Hs_full, w_grid, 'pchip');
-    
-    % 3. 权重与拟合
-    %wt = (1 ./ (w_grid + 0.01)) .* (mag_target + 0.1);
-    wt = mag_target*0 + 1;
-    [b, a] = invfreqz(Hs_complex, w_grid, order, order, wt, 30);
-    
-    % 4. 稳定性校正
-    [z, p, k] = tf2zp(b, a);
-    p(abs(p)>=1) = 1./conj(p(abs(p)>=1));
-    a = real(poly(p));
-    
-    % 5. 增益校准 
-    mean_mag_target = mean(mag_target);
-    
-    % 2. 计算当前滤波器在相同频率网格上的真实响应
-    [h_current, ~] = freqz(b, a, w_grid);
-    mean_mag_digital = mean(abs(h_current));
-    
-    % 3. 计算补偿比例并缩放分子系数
-    % 增加 eps (1e-12) 防止除以零，确保数值稳定性
-    gain_correction = mean_mag_target / (mean_mag_digital + 1e-12);
-    b = b * gain_correction;
+
+    H_half = min_phase_spec(1:n_fft/2+1);
+    H_min = interp1(w_linear, H_half, w_grid, 'pchip', 'extrap');
 end
 
-function err_var = compute_iir_error(b, a, R_target, w_grid)
 
-    % === 目标幅度 ===
-    mag_target = sqrt(R_target);
+%% ============================================================
+% 方法 3/4：prony / stmcb
+% =============================================================
 
-    % === 当前滤波器真实响应 ===
+function [b, a] = design_matched_iir_prony_minphase(R_target, w_grid, order)
+    mag_target = sqrt(max(R_target, 0));
+
+    % 先恢复最小相位复频响
+    H_min = reconstruct_minphase_from_mag(mag_target, w_grid);
+
+    % 频响 -> 线性频率网格 -> IFFT 得到冲激响应
+    n_fft = max(2^14, 2^nextpow2(length(w_grid) * 4));
+    w_linear = linspace(0, pi, n_fft/2 + 1)';
+    H_linear = interp1(w_grid, H_min, w_linear, 'pchip', 'extrap');
+
+    % 构造共轭对称频谱
+    H_full = [H_linear; conj(H_linear(end-1:-1:2))];
+    h = real(ifft(H_full));
+
+    % 截取前一段脉冲响应做 Prony
+    imp_len = max(8 * order, 128);
+    imp_len = min(imp_len, length(h));
+    h_trunc = h(1:imp_len);
+
+    [b, a] = prony(h_trunc, order, order);
+
+    a = stabilize_a(a);
+    b = calibrate_gain(b, a, mag_target, w_grid);
+end
+
+function [b, a] = design_matched_iir_stmcb_minphase(R_target, w_grid, order)
+    mag_target = sqrt(max(R_target, 0));
+
+    % 先恢复最小相位复频响
+    H_min = reconstruct_minphase_from_mag(mag_target, w_grid);
+
+    % 频响 -> 冲激响应
+    n_fft = max(2^14, 2^nextpow2(length(w_grid) * 4));
+    w_linear = linspace(0, pi, n_fft/2 + 1)';
+    H_linear = interp1(w_grid, H_min, w_linear, 'pchip', 'extrap');
+
+    H_full = [H_linear; conj(H_linear(end-1:-1:2))];
+    h = real(ifft(H_full));
+
+    imp_len = max(8 * order, 128);
+    imp_len = min(imp_len, length(h));
+    h_trunc = h(1:imp_len);
+
+    % 用 prony 结果做初始化，再 stmcb 迭代细化
+    [b0, a0] = prony(h_trunc, order, order);
+    [b, a] = stmcb(h_trunc, order, order, 20, a0);
+
+    a = stabilize_a(a);
+    b = calibrate_gain(b, a, mag_target, w_grid);
+end
+
+
+
+%% ============================================================
+% 方法 5：yulewalk
+% =============================================================
+function [b, a] = design_matched_iir_yulewalk(R_target, w_grid, order)
+    % 改进版 yulewalk 路线：
+    % 1) 对目标幅度做温和平滑
+    % 2) 转成功率谱模板给 yulewalk
+    % 3) 用 yulewalk 结果初始化 stmcb 做 ARMA 精修
+    % 4) 稳定化 + 加权增益校准
+
+    mag_target = sqrt(max(R_target(:), 0));
+    w_grid = w_grid(:);
+
+    % yulewalk 频率轴需要 [0,1]
+    f_norm = w_grid / pi;
+
+    % ------------------------------------------------------------
+    % 1. 构造更适合 yulewalk 的平滑模板
+    % ------------------------------------------------------------
+    % yulewalk 更适合功率谱模板；对 log-magnitude 做轻微平滑更稳
+    logmag = log(max(mag_target, 1e-8));
+
+    % Savitzky-Golay / 移动平均都可以，这里用简单稳妥的平滑
+    % 窗长按网格长度自适应，且保持奇数
+    win_len = max(31, 2*floor(length(logmag)/200) + 1);
+    if mod(win_len, 2) == 0
+        win_len = win_len + 1;
+    end
+
+    logmag_s = smoothdata(logmag, 'sgolay', win_len);
+    mag_s = exp(logmag_s);
+
+    % yulewalk 更适合适度压缩后的模板点，而不是过密点
+    n_knots = min(256, max(64, round(length(f_norm)/24)));
+    f2 = linspace(0, 1, n_knots).';
+    mag2 = interp1(f_norm, mag_s, f2, 'pchip', 'extrap');
+
+    % 关键：yulewalk 从“功率响应”角度更自然，喂 |H|^2
+    pwr2 = max(mag2.^2, 1e-12);
+
+    % ------------------------------------------------------------
+    % 2. yulewalk 初始解
+    % ------------------------------------------------------------
+    [b0, a0] = yulewalk(order, f2.', pwr2.');
+
+    % 先稳定化一次
+    a0 = stabilize_a(a0);
+
+    % ------------------------------------------------------------
+    % 3. 用 yulewalk 初值 + stmcb 精修
+    % ------------------------------------------------------------
+    % 为了让 stmcb 更贴近目标，先从平滑目标恢复一个近似最小相位复频响，
+    % 再变成脉冲响应，最后做 ARMA 迭代精修
+    H_seed = reconstruct_minphase_from_mag(mag_s, w_grid);
+
+    n_fft = max(2^14, 2^nextpow2(length(w_grid) * 4));
+    w_lin = linspace(0, pi, n_fft/2 + 1).';
+    H_lin = interp1(w_grid, H_seed, w_lin, 'pchip', 'extrap');
+
+    H_full = [H_lin; conj(H_lin(end-1:-1:2))];
+    h = real(ifft(H_full));
+
+    % 截断到适合低阶 ARMA 的长度
+    imp_len = max(128, 12 * order);
+    imp_len = min(imp_len, length(h));
+    h_trunc = h(1:imp_len);
+
+    % 用 yulewalk 的分母初始化 stmcb
+    try
+        [b, a] = stmcb(h_trunc, order, order, 25, a0);
+    catch
+        % 某些版本 stmcb 参数兼容性差，退回 yulewalk 初值
+        b = b0;
+        a = a0;
+    end
+
+    % ------------------------------------------------------------
+    % 4. 稳定化
+    % ------------------------------------------------------------
+    a = stabilize_a(a);
+
+    % ------------------------------------------------------------
+    % 5. 加权增益校准
+    % ------------------------------------------------------------
+    b = calibrate_gain(b, a, mag_target, w_grid);
+end
+
+
+%% ============================================================
+% 方法 6：iirlpnorm
+% =============================================================
+function [b, a] = design_matched_iir_iirlpnorm(R_target, w_grid, order)
+    mag_target = sqrt(max(R_target(:), 0));
+    w_grid = w_grid(:);
+    f_norm = w_grid / pi;
+
+    % ------------------------------------------------------------
+    % 1) 平滑目标
+    % ------------------------------------------------------------
+    logmag = log(max(mag_target, 1e-8));
+
+    win_len = max(21, 2*floor(numel(logmag)/150) + 1);
+    if mod(win_len, 2) == 0
+        win_len = win_len + 1;
+    end
+
+    try
+        logmag_s = smoothdata(logmag, 'sgolay', win_len);
+    catch
+        logmag_s = smoothdata(logmag, 'movmean', win_len);
+    end
+    %logmag_s = logmag;
+
+    mag_s = exp(logmag_s);
+
+    % ------------------------------------------------------------
+    % 2) 压缩为较少设计点
+    % ------------------------------------------------------------
+    n_knots = min(96, max(32, 10 * order));
+    f2 = linspace(0, 1, n_knots).';
+    a2 = interp1(f_norm, mag_s, f2, 'pchip', 'extrap');
+
+    floor_val = max(max(a2) * 1e-4, 1e-6);
+    a2 = max(a2, floor_val);
+    a2(1)   = max(a2(1), floor_val);
+    a2(end) = max(a2(end), floor_val);
+
+    % ------------------------------------------------------------
+    % 3) 权重
+    % ------------------------------------------------------------
+    wt = ones(size(a2));
+    wt(f2 < 0.05) = 2.0;
+    wt(f2 > 0.75) = 1.5;
+
+    slope = [0; abs(diff(log(max(a2, 1e-8))))];
+    if max(slope) > 0
+        wt = wt .* (1 + 1.5 * slope / max(slope));
+    end
+
+    % ------------------------------------------------------------
+    % 4) iirlpnorm
+    %    用“更宽松”的策略：先尽量给初值；不行就直接裸跑
+    % ------------------------------------------------------------
+    edges = [0 1];
+    p = [2 32];
+    dens = 20;
+
+    use_init = true;
+    b0 = [];
+    a0 = [];
+
+    % 关键修复：
+    % reconstruct_minphase_from_mag 的输入长度必须匹配，
+    % 所以要在原始 w_grid 上恢复，再插值到 f2*pi
+    try
+        H_seed_dense = reconstruct_minphase_from_mag(mag_s, w_grid);
+        H_seed = interp1(w_grid, H_seed_dense, f2*pi, 'pchip', 'extrap');
+
+        [b0, a0] = invfreqz(H_seed, f2*pi, order, order, wt, 30);
+
+        if any(~isfinite(b0)) || any(~isfinite(a0)) || abs(a0(1)) < 1e-14
+            use_init = false;
+        else
+            b0 = real(b0 / a0(1));
+            a0 = real(a0 / a0(1));
+            a0 = stabilize_a(a0);
+        end
+    catch
+        use_init = false;
+    end
+
+    % 更宽松：有初值就用初值，没有就直接跑
+    if use_init
+        [b, a] = iirlpnorm(order, order, f2.', edges, a2.', wt.', p, dens, b0, a0);
+    else
+        [b, a] = iirlpnorm(order, order, f2.', edges, a2.', wt.', p, dens);
+    end
+
+    % ------------------------------------------------------------
+    % 5) 后处理（也尽量宽松）
+    % ------------------------------------------------------------
+    if any(~isfinite(b)) || any(~isfinite(a)) || abs(a(1)) < 1e-14
+        error('iirlpnorm returned invalid coefficients.');
+    end
+
+    b = real(b / a(1));
+    a = real(a / a(1));
+
+    % 稳定化，但不要太苛刻
+    a = stabilize_a(a);
+
+    % 重新按原目标校准增益
+    b = calibrate_gain_passband_ls(b, a, mag_target, w_grid);
+
+    % 最后只做基本合法性检查
     h = freqz(b, a, w_grid);
-    mag_digital = abs(h);
+    if any(~isfinite(h))
+        error('iirlpnorm produced non-finite frequency response.');
+    end
+end
 
-    % === 统一误差（线性幅度 MSE）===
-    err_var = mean((mag_target - mag_digital).^2);
+%% ============================================================
+% 方法 7：模拟域 invfreqs + matched discretization
+% =============================================================
+function [b, a] = design_matched_iir_analog_matched(R_target, w_grid, order, fs)
+    % 更稳健版 analog 方法：
+    % 1) BLT 反扭曲到模拟频率轴
+    % 2) 用自由共轭零极点对参数化 4 阶模拟有理函数
+    % 3) 多起点 + 正则化拟合模拟域幅度
+    % 4) bilinear 回数字域
+    % 5) 结果验收，失败则 fallback
 
+    mag_target = sqrt(max(R_target(:), 0));
+    w_grid = w_grid(:);
+
+    if order ~= 4
+        %warning('This analog implementation is specialized for order = 4. Current order = %d', order);
+    end
+
+    % ------------------------------------------------------------
+    % 1) BLT 反扭曲 + 高频软限制
+    % ------------------------------------------------------------
+    Omega_raw = 2 * fs * tan(w_grid / 2);
+
+    % Nyquist 附近会非常大，优化很容易被拖飞；做一个软上限更稳
+    Omega_cap = 2 * pi * fs * 8;   % 可调：4~12 倍 fs 都行
+    Omega = min(Omega_raw, Omega_cap);
+
+    % ------------------------------------------------------------
+    % 2) 找主变化区
+    % ------------------------------------------------------------
+    mag_db = 20 * log10(mag_target + 1e-12);
+    dmag = abs(gradient(mag_db) ./ max(gradient(log(Omega + 10)), 1e-12));
+    [~, idx0] = max(dmag);
+    idx0 = max(2, min(length(Omega)-1, idx0));
+    w0 = Omega(idx0);
+    w0 = max(w0, 2*pi*20);
+
+    % 额外找一个“高权重中心频率”
+    [~, idx_pk] = max(mag_target);
+    wpk = Omega(max(2, min(length(Omega)-1, idx_pk)));
+    wpk = max(wpk, 2*pi*20);
+
+    % ------------------------------------------------------------
+    % 3) 多起点初始化
+    % ------------------------------------------------------------
+    gain0 = max(median(mag_target), 1e-3);
+
+    x_candidates = [
+        log(gain0), log(0.10*w0), log(0.92*w0), log(0.14*w0), log(1.08*w0), log(0.08*w0), log(0.95*w0), log(0.10*w0), log(1.05*w0);
+        log(gain0), log(0.06*w0), log(0.85*w0), log(0.20*w0), log(1.15*w0), log(0.05*w0), log(0.90*w0), log(0.07*w0), log(1.10*w0);
+        log(gain0), log(0.12*wpk), log(0.95*wpk), log(0.16*wpk), log(1.05*wpk), log(0.08*wpk), log(0.97*wpk), log(0.09*wpk), log(1.03*wpk);
+        log(gain0), log(0.20*w0), log(0.70*w0), log(0.25*w0), log(1.30*w0), log(0.10*w0), log(0.80*w0), log(0.12*w0), log(1.20*w0)
+    ];
+
+    obj_scalar = @(x) analog_pz_cost_scalar_regularized(x, Omega, mag_target);
+
+    best_val = inf;
+    best_x = x_candidates(1, :);
+
+    opts_nm = optimset( ...
+        'Display', 'off', ...
+        'MaxIter', 3000, ...
+        'MaxFunEvals', 16000, ...
+        'TolX', 1e-8, ...
+        'TolFun', 1e-9);
+
+    for k = 1:size(x_candidates, 1)
+        x0 = x_candidates(k, :);
+        try
+            x_try = fminsearch(obj_scalar, x0, opts_nm);
+            v_try = obj_scalar(x_try);
+            if isfinite(v_try) && v_try < best_val
+                best_val = v_try;
+                best_x = x_try;
+            end
+        catch
+        end
+    end
+
+    x1 = best_x;
+
+    % ------------------------------------------------------------
+    % 4) 如果有 lsqnonlin，再做向量残差细化
+    % ------------------------------------------------------------
+    if exist('lsqnonlin', 'file') == 2
+        obj_vec = @(x) analog_pz_cost_vector_regularized(x, Omega, mag_target);
+        try
+            opts = optimoptions('lsqnonlin', ...
+                'Display', 'off', ...
+                'MaxIterations', 300, ...
+                'MaxFunctionEvaluations', 6000, ...
+                'FunctionTolerance', 1e-10, ...
+                'StepTolerance', 1e-10);
+            x1 = lsqnonlin(obj_vec, x1, [], [], opts);
+        catch
+        end
+    end
+
+    % ------------------------------------------------------------
+    % 5) 构造模拟域传函
+    % ------------------------------------------------------------
+    [bs, as] = analog_pz_param_to_tf_safe(x1, w0);
+
+    % 连续域稳定化
+    as = local_stabilize_s_den(as);
+
+    % ------------------------------------------------------------
+    % 6) 双线性变换
+    % ------------------------------------------------------------
+    [b, a] = bilinear(bs, as, fs);
+
+    % 数字域稳定化
+    a = stabilize_a(a);
+
+    % 增益校准
+    b = calibrate_gain_passband_ls(b, a, mag_target, w_grid);
+
+    % ------------------------------------------------------------
+    % 7) 结果验收，不合格就 fallback
+    % ------------------------------------------------------------
+    if ~is_valid_digital_filter(b, a, w_grid)
+       % warning('analog matched produced invalid digital filter, fallback to invfreqz.');
+        [b, a] = design_matched_iir_invfreqz(R_target, w_grid, order);
+        return;
+    end
+
+    % 如果误差过大，也认为这次优化跑偏了
+    h = freqz(b, a, w_grid);
+    err_db = 20*log10(abs(h) + 1e-12) - 20*log10(mag_target + 1e-12);
+    if ~all(isfinite(err_db)) || sqrt(mean(err_db.^2)) > 6
+       % warning('analog matched fit is poor, fallback to invfreqz.');
+        [b, a] = design_matched_iir_invfreqz(R_target, w_grid, order);
+        return;
+    end
 end
 
 
-%% 测试主脚本
-fs = 48000;
-num_points = 8192; 
+function [b, a] = analog_pz_param_to_tf_safe(x, w_ref)
+    g = exp(x(1));
 
-% 对应 np.geomspace: 生成几何（对数）分布频率网格
-f_min = 70.0;
-w_min = 2 * pi * f_min / fs;
-w_grid = logspace(log10(w_min), log10(pi), num_points)'; % 注意转置为列向量
+    sigma_z1 = exp(x(2)); omega_z1 = exp(x(3));
+    sigma_z2 = exp(x(4)); omega_z2 = exp(x(5));
+    sigma_p1 = exp(x(6)); omega_p1 = exp(x(7));
+    sigma_p2 = exp(x(8)); omega_p2 = exp(x(9));
 
-freqs = w_grid * fs / (2 * pi);
+    % 相对参考频率做更合理的限制
+    smin = max(1e-3, 1e-4 * w_ref);
+    smax = max(1e2, 20   * w_ref);
+    omin = max(1e-2, 0.05 * w_ref);
+    omax = max(1e2, 4.00 * w_ref);
 
-%% 2. 定义模拟频响目标
-fc = 2300;              % 截止频率 (Hz)
-wc = 2 * pi * fc;        % 模拟角频率 (rad/s)
-Q = 3;
-stages = 2;
+    sigma_z1 = min(max(sigma_z1, smin), smax);
+    sigma_z2 = min(max(sigma_z2, smin), smax);
+    sigma_p1 = min(max(sigma_p1, smin), smax);
+    sigma_p2 = min(max(sigma_p2, smin), smax);
 
-s = 1j * 2 * pi * freqs; 
+    omega_z1 = min(max(omega_z1, omin), omax);
+    omega_z2 = min(max(omega_z2, omin), omax);
+    omega_p1 = min(max(omega_p1, omin), omax);
+    omega_p2 = min(max(omega_p2, omin), omax);
 
-% --- 定义 Hs_peaking 匿名函数 ---
-Hs_peaking = @(s, A_target) (1 + (A_target - 1) * ...
-    (1 ./ (1 + (abs((imag(s).^2 - wc^2) ./ (wc/Q * imag(s) + 1e-200))).^(2*stages))));
+    % 防止两个共轭对频率完全扎堆
+    if abs(omega_z2 - omega_z1) < 0.03 * w_ref
+        omega_z2 = omega_z1 + 0.03 * w_ref;
+    end
+    if abs(omega_p2 - omega_p1) < 0.03 * w_ref
+        omega_p2 = omega_p1 + 0.03 * w_ref;
+    end
 
-% --- 定义 Hs_lowpass 匿名函数 ---
-if Q > 1/sqrt(2)
-    peak_factor = 1 - 1 / (2 * Q^2);
-else
-    peak_factor = 1.0;
+    % 最小阻尼，避免超高Q直接飞
+    sigma_p1 = max(sigma_p1, 0.02 * omega_p1);
+    sigma_p2 = max(sigma_p2, 0.02 * omega_p2);
+
+    z1 = -sigma_z1 + 1j * omega_z1;
+    z2 = -sigma_z2 + 1j * omega_z2;
+    p1 = -sigma_p1 + 1j * omega_p1;
+    p2 = -sigma_p2 + 1j * omega_p2;
+
+    z_all = [z1, conj(z1), z2, conj(z2)];
+    p_all = [p1, conj(p1), p2, conj(p2)];
+
+    b = g * real(poly(z_all));
+    a = real(poly(p_all));
+
+    b = real_if_close(b);
+    a = real_if_close(a);
+
+    if any(~isfinite(b)) || any(~isfinite(a)) || abs(a(1)) < 1e-14
+        %error('analog_pz_param_to_tf_safe produced invalid coefficients.');
+    end
+
+    b = b / a(1);
+    a = a / a(1);
 end
 
-wc_comp = wc * (peak_factor)^(0.5 - 1 / (2 * stages));
+function err = analog_pz_cost_vector_regularized(x, Omega, mag_target)
+    % 用中频作参考尺度
+    w_ref = Omega(max(2, round(0.35 * numel(Omega))));
 
-Hs_lowpass = @(s) (1 ./ ( (1 - (abs(imag(s))/wc_comp).^(2*stages)) + ...
-    1j * ((abs(imag(s))/wc_comp).^stages / Q) ));
+    try
+        [b, a] = analog_pz_param_to_tf_safe(x, w_ref);
+    catch
+        err = 1e3 * ones(2 * numel(Omega) + 12, 1);
+        return;
+    end
 
-%% 3. 选择传递函数并计算目标幅度
-% 你可以自由切换这行：Hs = Hs_peaking(s, 2.0) 或 Hs_lowpass(s)
-Hs_obj = Hs_peaking(s,4.0); 
-mag_target = abs(Hs_obj);
+    p = roots(a);
+    z = roots(b);
 
-% 转换为你的谱分解算法需要的能量响应
-R_target = mag_target.^2;
+    if any(~isfinite(p)) || any(~isfinite(z))
+        err = 1e3 * ones(2 * numel(Omega) + 12, 1);
+        return;
+    end
 
-% 执行拟合
-[b_spec, a_spec] = design_matched_iir_spectral(R_target, w_grid, 4);
-[b_invz, a_invz] = design_matched_iir_invfreqz(R_target, w_grid, 4);
-errv1 = compute_iir_error(b_spec, a_spec,R_target,w_grid);
-errv2 = compute_iir_error(b_invz, a_invz,R_target,w_grid);
+    % 连续域稳定性
+    if any(real(p) >= -1e-9)
+        err = 1e3 * ones(2 * numel(Omega) + 12, 1);
+        return;
+    end
 
-fprintf("spectral errv:%f\ninvfreqz errv:%f\n",errv1,errv2);
+    s = 1j * Omega;
+    den = polyval(a, s);
+    num = polyval(b, s);
 
-%% 绘图
-[h_plot1, w_plot1] = freqz(b_spec, a_spec, 16384, fs);
-[h_plot2, w_plot2] = freqz(b_invz, a_invz, 16384, fs);
-figure;
-semilogx(freqs, 20*log10(mag_target), 'k--', 'LineWidth', 2); hold on;
-semilogx(w_plot1, 20*log10(abs(h_plot1)), 'b-', 'LineWidth', 1.5);
-semilogx(w_plot2, 20*log10(abs(h_plot2)), 'r-', 'LineWidth', 1.5);
-grid on; xlim([100, 24000]); ylim([-30, 30]);
-title('MATLAB Spectral Factorization Fitting');
-legend('Analog Prototype', 'Digital IIR (Spectral Fact)', 'Digital IIR (invfreqz based)');
+    if any(~isfinite(den)) || any(abs(den) < 1e-18) || any(~isfinite(num))
+        err = 1e3 * ones(2 * numel(Omega) + 12, 1);
+        return;
+    end
+
+    H = num ./ den;
+    mag = abs(H);
+
+    if any(~isfinite(mag)) || any(mag > 1e6 * max(1, max(mag_target)))
+        err = 1e3 * ones(2 * numel(Omega) + 12, 1);
+        return;
+    end
+
+    err_lin = mag - mag_target;
+    err_db  = 20*log10(mag + 1e-9) - 20*log10(mag_target + 1e-9);
+
+    wt = ones(size(Omega));
+
+    % 低频略加强
+    wt(Omega < Omega(round(end*0.15))) = 1.3;
+
+    % 高频加强，但别太猛
+    wt(Omega > Omega(round(end*0.90))) = wt(Omega > Omega(round(end*0.90))) * 1.6;
+    wt(Omega > Omega(round(end*0.97))) = wt(Omega > Omega(round(end*0.97))) * 2.2;
+
+    % 主变化区加权
+    gmag = abs(gradient(log(max(mag_target, 1e-9))));
+    if max(gmag) > 0
+        wt = wt .* (1 + 0.7 * gmag / max(gmag));
+    end
+
+    mask_small = mag_target < max(mag_target) * 1e-3;
+
+    wt_db = wt;
+    wt_db(mask_small) = 0.12 * wt_db(mask_small);
+
+    wt_lin = wt;
+    wt_lin(~mask_small) = 1.8 * wt_lin(~mask_small);
+
+    data_err = [ ...
+        0.18 * wt_db  .* err_db; ...
+        0.90 * wt_lin .* err_lin ...
+    ];
+
+    % ------------------------------------------------------------
+    % 正则项
+    % ------------------------------------------------------------
+    reg = [];
+
+    % 极点阻尼不能太小：sigma / omega 太小意味着Q太高
+    p_up = p(imag(p) > 0);
+    z_up = z(imag(z) > 0);
+
+    for k = 1:numel(p_up)
+        sig = max(-real(p_up(k)), 1e-12);
+        omg = max(abs(imag(p_up(k))), 1e-12);
+        ratio = sig / omg;
+        reg(end+1,1) = 5 * max(0, 0.025 - ratio); %#ok<AGROW>
+    end
+
+    % 两个极点对太近时惩罚
+    if numel(p_up) >= 2
+        dp = abs(imag(p_up(1)) - imag(p_up(2))) / max(w_ref, 1);
+        reg(end+1,1) = 2 * max(0, 0.04 - dp); %#ok<AGROW>
+    end
+
+    % 两个零点对太近时惩罚
+    if numel(z_up) >= 2
+        dz = abs(imag(z_up(1)) - imag(z_up(2))) / max(w_ref, 1);
+        reg(end+1,1) = 1.2 * max(0, 0.03 - dz); %#ok<AGROW>
+    end
+
+    % 极点频率离开主要工作区太远时软惩罚
+    for k = 1:numel(p_up)
+        omg = abs(imag(p_up(k)));
+        reg(end+1,1) = 0.03 * max(0, omg / max(w_ref,1) - 5.0); %#ok<AGROW>
+        reg(end+1,1) = 0.10 * max(0, 0.15 - omg / max(w_ref,1)); %#ok<AGROW>
+    end
+
+    % 增益过大过小时软惩罚
+    lg = x(1);
+    reg(end+1,1) = 0.02 * max(0, abs(lg) - 8); %#ok<AGROW>
+
+    err = real([data_err(:); reg(:)]);
+end
+
+function val = analog_pz_cost_scalar_regularized(x, Omega, mag_target)
+    e = analog_pz_cost_vector_regularized(x, Omega, mag_target);
+    val = mean(e.^2);
+end
+
+function ok = is_valid_digital_filter(b, a, w_grid)
+    ok = true;
+
+    if any(~isfinite(b)) || any(~isfinite(a)) || isempty(a) || abs(a(1)) < 1e-14
+        ok = false;
+        return;
+    end
+
+    p = roots(a);
+    if any(~isfinite(p)) || any(abs(p) >= 0.9998)
+        ok = false;
+        return;
+    end
+
+    try
+        h = freqz(b, a, w_grid);
+    catch
+        ok = false;
+        return;
+    end
+
+    if any(~isfinite(h)) || any(abs(h) > 1e8)
+        ok = false;
+        return;
+    end
+end
+
+%% ============================================================
+% 评估
+% =============================================================
+function out = evaluate_method(name, b, a, R_target, w_grid, fs)
+    mag_target = sqrt(max(R_target, 0));
+    h = freqz(b, a, w_grid);
+    mag = abs(h);
+
+    err_lin = mag - mag_target;
+    err_db  = 20*log10(mag + 1e-15) - 20*log10(mag_target + 1e-15);
+
+    p = roots(a);
+
+    out.name = name;
+    out.b = b;
+    out.a = a;
+    out.mse_linear = mean(err_lin.^2);
+    out.rmse_db = sqrt(mean(err_db.^2));
+    out.max_db_abs = max(abs(err_db));
+    out.max_pole_radius = max(abs(p));
+    out.is_stable = all(abs(p) < 1 - 1e-10);
+
+    [out.h_plot, out.f_plot] = freqz(b, a, 4096, fs);
+end
+
+%% ============================================================
+% 工具函数
+% =============================================================
+function a = stabilize_a(a)
+    %[z, p, k] = tf2zp(1, a); %#ok<ASGLU>
+    %idx = abs(p) >= 1;
+    %p(idx) = 1 ./ conj(p(idx));
+    %a = real(poly(p));
+    %a = a / a(1);
+    a = polystab(a);
+end
+
+
+function wt = build_weight_curve(mag_target, w_grid)
+    % 一个比较保守的默认权重
+    wt = ones(size(w_grid));
+
+    % 低频稍微加重
+    wt(w_grid < 0.08*pi) = 1.5;
+
+    % 峰值区域可适度加重：目标幅度越大，权重略高
+    wt = wt .* (0.7 + 0.3 * mag_target / max(mag_target + 1e-12));
+
+    wt = wt(:);
+end
+
+
+function b = calibrate_gain_weighted_ls(b, a, mag_target, w_grid)
+    h = freqz(b, a, w_grid);
+    % 这里继续保留“平均线性幅度”校准
+    g = mean(mag_target) / (mean(abs(h)) + 1e-12);
+    b = real(b * g);
+end
+function b = calibrate_gain(b, a, mag_target, w_grid)
+    h = freqz(b, a, w_grid);
+    mag_cur = abs(h);
+
+    wt = ones(size(w_grid));
+    wt(w_grid < 0.08*pi) = 1.5;
+    wt = wt .* (0.7 + 0.3 * mag_target / max(mag_target + 1e-12));
+
+    g = sum(wt .* mag_cur .* mag_target) / (sum(wt .* mag_cur.^2) + 1e-12);
+    b = real(b * g);
+end
+
+function b = calibrate_gain_passband_ls(b, a, mag_target, w_grid)
+    h = freqz(b, a, w_grid);
+    mag_cur = abs(h);
+
+    % 只在目标“不是接近 0”的频点上做增益匹配
+    mask = mag_target > max(mag_target) * 1e-3;
+
+    % 如果 mask 太少，退化成全带
+    if nnz(mask) < 16
+        mask = true(size(mag_target));
+    end
+
+    mc = mag_cur(mask);
+    mt = mag_target(mask);
+
+    % 鲁棒一点：避免极端点支配
+    g = sum(mc .* mt) / (sum(mc.^2) + 1e-12);
+
+    b = real(b * g);
+end
