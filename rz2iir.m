@@ -18,10 +18,10 @@ function compare_matched_iir_methods()
     %% =========================
     % 1. 定义模拟目标幅度
     % ==========================
-    fc = 230;
+    fc = 1800;
     wc = 2 * pi * fc;
     Q = 2;
-    stages = 2;
+    stages = 4;
 
     s = 1j * 2 * pi * freqs;
     
@@ -41,7 +41,7 @@ function compare_matched_iir_methods()
         1j * ((abs(imag(s))/wc_comp).^stages / Q) ));
 
     % 你可以切换目标
-    Hs_obj = Hs_lowpass(s);
+    Hs_obj = Hs_peaking(s);
     mag_target = abs(Hs_obj);
     R_target = mag_target.^2;
 
@@ -210,8 +210,8 @@ function compare_matched_iir_methods()
         legends{end+1} = results(k).name; %#ok<AGROW>
     end
     grid on;
-    xlim([20, 24000]);
-    ylim([-40, 20]);
+    xlim([100, 24000]);
+    ylim([-60, 30]);
     xlabel('Frequency (Hz)');
     ylabel('Magnitude (dB)');
     title('Warp-assisted IIR fitting comparison');
