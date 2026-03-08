@@ -1,5 +1,3 @@
-![](https://files.mdnice.com/user/176339/e0f93166-4fc0-4912-9916-1ec6e938cfcd.png)
-
 # 匹配模拟幅度响应的数字 IIR 滤波器离线设计
 
 L-MODEL团队 赤狐
