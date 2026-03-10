@@ -102,12 +102,12 @@ if __name__ == "__main__":
     freqs = w_grid * fs / (2 * np.pi)
 
     # 定义一个模拟频响(或模拟幅度响应)
-    fc = 21000             # 截止频率 (Hz)
+    fc = 10000             # 截止频率 (Hz)
     wc = 2 * np.pi * fc    # 必须转换为模拟角频率 (rad/s)
     Q = 10
     
     s = 1j * 2 * np.pi * freqs 
-    stages = 1 #必须接近1阶(1个二阶系统)，拟合在高低频才有解。如果大于1阶，改之后的iir的拟合阶数也不能很好地拟合低频
+    stages = 10 #必须接近1阶(1个二阶系统)，拟合在高低频才有解。如果大于1阶，改之后的iir的拟合阶数也不能很好地拟合低频
     def Hs_peaking(s, A_target = 2):
         w = np.abs(s.imag)
         B = wc / Q
@@ -133,9 +133,9 @@ if __name__ == "__main__":
     # 转换为算法需要的能量响应 |H(w)|^2
     R_target = mag_target**2
     # 拟合目标响应
-    target_order = 4
+    target_order = 64
     b_dig, a_dig =  design_matched_iir_from_response(R_target, w_grid, order=target_order)
-    
+
     
     # ==========================================
     # 2. 观测阶段：使用高密度网格还原真实的连续曲线

@@ -62,10 +62,10 @@ function nbt_lowpass_playground_irka
     q_max = 10.0;
 
     fo_ratio_min = 0.2;
-    fo_ratio_max = 2.0;
+    fo_ratio_max = 1.0;
 
     fcmap_ratio_min = 0.2;
-    fcmap_ratio_max = 1;
+    fcmap_ratio_max = 2;
 
     gammaHat_min = 0.2;
     gammaHat_max = 5.0;
