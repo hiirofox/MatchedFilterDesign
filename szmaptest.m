@@ -1,20 +1,28 @@
 %% ============================================================
-% Direct G(z) optimization without BLT shell
+% Stable monotonic frequency-mapping optimization
 %
-% G(z) = j*(2/T)*R(c),   c = (z + z^-1)/2
+% Design Omega(w) directly via:
+%   dOmega/dw = exp(Q(w)) > 0
 %
-% On unit circle z = e^{jw}:
-%   c = cos(w) in R
-%   G(e^{jw}) = j*Omega(w)
-%   Omega(w) = (2/T)*R(cos(w))
+% Then:
+%   Omega(w) = integral_0^w exp(Q(t)) dt
 %
-% We optimize R(c) directly to approximate:
-%   Omega_target(w) = w/T
+% Normalize to enforce:
+%   Omega(0) = 0
+%   Omega(pi) = pi/T
 %
-% Validation is done on a 2nd-order analog lowpass prototype:
-%   Hs(s) = w0^2 / (s^2 + (w0/Q)s + w0^2)
+% This guarantees:
+%   - strictly monotonic mapping
+%   - no folding
+%   - no collapse to zero line
 %
-% This optimization is prototype-independent.
+% Validation:
+%   Compare analog prototype Hs(j*2*pi*f)
+%   with digital-induced response Hs(j*Omega(w))
+%
+% NOTE:
+%   This step designs the target frequency mapping first.
+%   It does NOT yet produce a closed-form rational G(z).
 %% ============================================================
 
 clear; clc; close all;
@@ -25,88 +33,89 @@ T    = 1/fs;
 
 fmin = 20;
 fmax = fs/2;
-Nw   = 3000;
+Nw   = 4000;
 
-% Rational model order:
-% R(c) = (1-c)*(a0 + a1*c + ... + am*c^m) / (1 + b1*c + ... + bn*c^n)
-m = 4;   % numerator polynomial order
-n = 4;   % denominator polynomial order
+% Q(w) basis order:
+K = 8;   % increase to 10 or 12 if needed
 
-% Optimization
-maxIter    = 3000;
-displayOpt = 'iter';     % 'off' or 'iter'
+% Optimization options
+maxIter    = 12000;
+displayOpt = 'iter';   % 'off' or 'iter'
 
-% weights / penalties
-lambda_hi    = 10;       % emphasize high frequency
-pow_hi       = 4;
-lambda_mono  = 1e4;      % monotonicity penalty
-lambda_pos   = 1e4;      % positivity penalty on Omega
-lambda_den   = 1e4;      % denominator positivity penalty
-lambda_smooth= 1e1;      % smoothness penalty
+% Weights
+lambda_hi      = 8;    % high-frequency emphasis
+pow_hi         = 3;
+lambda_anchor  = 200;
+lambda_smooth  = 1e-2;
+lambda_qenergy = 1e-3;
 
-% Validation analog prototype
-f0 = 8000;
-Q  = 5.707;
+eps_log = 1e-12;
+
+% Prototype for validation only
+f0 = 22000;
+Qp = 5.707;
 w0 = 2*pi*f0;
 
 %% ---------------- Frequency grid ----------------
 f = logspace(log10(fmin), log10(fmax), Nw);
-w = 2*pi*f/fs;                 % 0..pi
-c = cos(w);
-
-Omega_target = w / T;          % prototype-independent target
+w = 2*pi*f/fs;                 % in (0, pi]
+Omega_target = w / T;
 
 W = 1 + lambda_hi*(w/pi).^pow_hi;
 
-%% ---------------- Initial guess ----------------
-% theta = [a0 ... am  b1 ... bn]
-theta0 = zeros(1, (m+1) + n);
+%% ---------------- Anchor points ----------------
+f_anchor = [200, 1000, 3000, 8000, 12000, 18000, 22000];
+f_anchor = f_anchor(f_anchor < fs/2);
+w_anchor = 2*pi*f_anchor/fs;
+Omega_anchor_target = w_anchor / T;
 
-% rough low-frequency slope initialization:
-% near w=0, c ~ 1 - w^2/2, so (1-c) ~ w^2/2
-% thus this model naturally starts quadratically near DC, not linearly.
-% that's a structural limitation of pure R(cos w) model.
-% still, let's initialize mildly.
-theta0(1) = 1.0;
+%% ---------------- Initial guess ----------------
+% q = [q0 ... qK], Q(w)=sum qk*cos(k*w)
+q0 = zeros(K+1,1);
 
 %% ---------------- Optimization ----------------
-objfun = @(th) objective_direct_G(th, c, w, T, Omega_target, W, m, n, ...
-                                  lambda_mono, lambda_pos, lambda_den, lambda_smooth);
+objfun = @(q) objective_monotonic_mapping( ...
+    q, w, Omega_target, W, ...
+    w_anchor, Omega_anchor_target, ...
+    T, lambda_anchor, lambda_smooth, lambda_qenergy, eps_log);
 
 opts = optimset('Display', displayOpt, ...
                 'MaxIter', maxIter, ...
-                'MaxFunEvals', 50000, ...
-                'TolX', 1e-9, ...
-                'TolFun', 1e-9);
+                'MaxFunEvals', 200000, ...
+                'TolX', 1e-10, ...
+                'TolFun', 1e-10);
 
-theta_opt = fminsearch(objfun, theta0, opts);
+q_opt = fminsearch(objfun, q0, opts);
 
-[a, b] = unpack_theta(theta_opt, m, n);
+%% ---------------- Evaluate optimized mapping ----------------
+[Qw, dOmega_raw, Omega_opt] = build_monotonic_mapping(q_opt, w, T);
+Omega_blt   = (2/T) * tan(w/2);
+Omega_ideal = w / T;
 
-fprintf('\nOptimized coefficients:\n');
-fprintf('a = '); disp(a);
-fprintf('b = '); disp(b);
-
-%% ---------------- Evaluate mapping ----------------
-[R_opt, num_opt, den_opt] = eval_R_model(c, a, b);
-Omega_opt = (2/T) * R_opt;
-
-% BLT for reference
-Omega_blt = (2/T) * tan(w/2);
-
-% derivatives
 dOmega_opt = numerical_derivative(w, Omega_opt);
 
-fprintf('Min Omega_opt = %.6g\n', min(Omega_opt));
-fprintf('Min dOmega/dw = %.6g\n', min(dOmega_opt));
-fprintf('Omega_opt(end)/(2pi) = %.6f Hz\n', Omega_opt(end)/(2*pi));
+fprintf('\nOptimized q coefficients:\n');
+disp(q_opt(:).');
 
-%% ---------------- Validate on analog prototype ----------------
-Hs = analog_lp_response(2*pi*f, w0, Q);
+fprintf('Min dOmega/dw    = %.12g\n', min(dOmega_opt));
+fprintf('Omega(0+)        = %.12g rad/s\n', Omega_opt(1));
+fprintf('Omega(pi)        = %.12g rad/s\n', Omega_opt(end));
+fprintf('Target pi/T      = %.12g rad/s\n', pi/T);
 
-% Digital response induced by G(e^jw)=j*Omega(w)
-Hz_blt = analog_lp_response(Omega_blt, w0, Q);
-Hz_opt = analog_lp_response(Omega_opt, w0, Q);
+%% ---------------- Anchor evaluation ----------------
+Omega_anchor_opt = interp1(w, Omega_opt, w_anchor, 'pchip');
+
+disp(' ');
+disp('Anchor mapping check [Hz]:');
+disp(table(f_anchor(:), ...
+           (Omega_anchor_target(:)/(2*pi)), ...
+           (Omega_anchor_opt(:)/(2*pi)), ...
+           'VariableNames', {'f_anchor_Hz','TargetAnalogHz','MappedAnalogHz'}));
+
+%% ---------------- Validation on analog prototype ----------------
+Hs     = analog_lp_response(2*pi*f, w0, Qp);
+Hz_blt = analog_lp_response(Omega_blt, w0, Qp);
+Hz_opt = analog_lp_response(Omega_opt, w0, Qp);
 
 Hs_dB     = 20*log10(abs(Hs) + 1e-15);
 Hz_blt_dB = 20*log10(abs(Hz_blt) + 1e-15);
@@ -120,25 +129,25 @@ fprintf('OPT dB RMSE = %.6f dB\n', rms(err_opt));
 
 %% ---------------- Plots ----------------
 figure('Color','w');
-semilogx(f, Omega_target/(2*pi), 'LineWidth', 1.8); hold on;
+semilogx(f, Omega_ideal/(2*pi), 'LineWidth', 1.8); hold on;
 semilogx(f, Omega_blt/(2*pi), '--', 'LineWidth', 1.5);
 semilogx(f, Omega_opt/(2*pi), 'LineWidth', 1.8);
 grid on;
 xlim([fmin fmax]);
 xlabel('Digital frequency (Hz)');
 ylabel('Mapped analog frequency (Hz)');
-title('Frequency mapping: ideal vs BLT vs direct G(z)');
-legend('Ideal \Omega=\omega/T', 'BLT', 'Direct G(z)', 'Location', 'best');
+title('Frequency mapping: ideal vs BLT vs optimized monotonic mapping');
+legend('Ideal \Omega=\omega/T', 'BLT', 'Optimized monotonic', 'Location', 'best');
 
 figure('Color','w');
-semilogx(f, (Omega_blt - Omega_target)/(2*pi), '--', 'LineWidth', 1.5); hold on;
-semilogx(f, (Omega_opt - Omega_target)/(2*pi), 'LineWidth', 1.8);
+semilogx(f, log(Omega_blt + eps_log) - log(Omega_ideal + eps_log), '--', 'LineWidth', 1.5); hold on;
+semilogx(f, log(Omega_opt + eps_log) - log(Omega_ideal + eps_log), 'LineWidth', 1.8);
 grid on;
 xlim([fmin fmax]);
-xlabel('Digital frequency (Hz)');
-ylabel('Mapping error (Hz)');
-title('Frequency mapping error');
-legend('BLT error', 'Direct G(z) error', 'Location', 'best');
+xlabel('Frequency (Hz)');
+ylabel('log-mapping error');
+title('Log frequency mapping error');
+legend('BLT', 'Optimized monotonic', 'Location', 'best');
 
 figure('Color','w');
 semilogx(f, Hs_dB, 'LineWidth', 1.8); hold on;
@@ -146,11 +155,11 @@ semilogx(f, Hz_blt_dB, '--', 'LineWidth', 1.5);
 semilogx(f, Hz_opt_dB, 'LineWidth', 1.8);
 grid on;
 xlim([fmin fmax]);
-ylim([-40 10]);
+ylim([-40 20]);
 xlabel('Frequency (Hz)');
 ylabel('Magnitude (dB)');
-title(sprintf('Analog vs BLT vs Direct G(z) | f_s=%g Hz, f_0=%g Hz, Q=%g', fs, f0, Q));
-legend('Analog prototype', 'BLT', 'Direct G(z)', 'Location', 'best');
+title(sprintf('Analog vs BLT vs optimized monotonic mapping | f_s=%g Hz, f_0=%g Hz, Q=%g', fs, f0, Qp));
+legend('Analog prototype', 'BLT', 'Optimized monotonic', 'Location', 'best');
 
 figure('Color','w');
 semilogx(f, err_blt, '--', 'LineWidth', 1.5); hold on;
@@ -160,86 +169,77 @@ xlim([fmin fmax]);
 xlabel('Frequency (Hz)');
 ylabel('Magnitude error (dB)');
 title('Digital minus Analog magnitude error');
-legend('BLT error', 'Direct G(z) error', 'Location', 'best');
+legend('BLT error', 'Optimized monotonic error', 'Location', 'best');
 
 figure('Color','w');
-semilogx(f, dOmega_opt, 'LineWidth', 1.6);
+semilogx(f, dOmega_opt, 'LineWidth', 1.6); hold on;
+yline(0, '--');
 grid on;
 xlim([fmin fmax]);
 xlabel('Frequency (Hz)');
 ylabel('d\Omega/d\omega');
-title('Monotonicity check of direct G(z) mapping');
+title('Monotonicity check (should stay > 0)');
 
-%% ---------------- Print final G(z) form ----------------
-disp(' ');
-disp('Final mapping form:');
-disp('G(z) = j*(2/T)*R(c),  c=(z+z^-1)/2');
-disp('R(c) = (1-c)*(a0 + a1*c + ... + am*c^m) / (1 + b1*c + ... + bn*c^n)');
+figure('Color','w');
+plot(w, Qw, 'LineWidth', 1.5); grid on;
+xlabel('\omega (rad/sample)');
+ylabel('Q(\omega)');
+title('Exponent basis Q(\omega)');
 
 %% ============================================================
 %% Local functions
 %% ============================================================
 
-function J = objective_direct_G(theta, c, w, T, Omega_target, W, m, n, ...
-                                lambda_mono, lambda_pos, lambda_den, lambda_smooth)
+function J = objective_monotonic_mapping( ...
+    q, w, Omega_target, W, ...
+    w_anchor, Omega_anchor_target, ...
+    T, lambda_anchor, lambda_smooth, lambda_qenergy, eps_log)
 
-    [a, b] = unpack_theta(theta, m, n);
-    [R, ~, den] = eval_R_model(c, a, b);
+    [Qw, dOmega_raw, Omega] = build_monotonic_mapping(q, w, T);
 
-    Omega = (2/T) * R;
+    % Main fit: log-frequency error
+    Elog = log(Omega + eps_log) - log(Omega_target + eps_log);
+    Jfit = mean(W(:) .* (Elog(:).^2));
 
-    % fit mapping directly
-    E = Omega - Omega_target;
-    Jfit = mean(W(:) .* (E(:).^2));
+    % Anchor fit
+    Omega_anchor = interp1(w, Omega, w_anchor, 'pchip');
+    Eanchor = log(Omega_anchor + eps_log) - log(Omega_anchor_target + eps_log);
+    Janchor = mean(Eanchor.^2);
 
-    % positivity of mapping
-    pos_violation = max(0, -Omega + 1e-8);
-    Jpos = mean(pos_violation.^2);
+    % Smoothness on derivative shape
+    d2 = numerical_derivative(w, dOmega_raw);
+    Jsmooth = mean(d2.^2);
 
-    % monotonicity
-    dOmega = numerical_derivative(w, Omega);
-    mono_violation = max(0, -dOmega + 1e-8);
-    Jmono = mean(mono_violation.^2);
-
-    % denominator should not cross zero on the fitting interval
-    den_violation = max(0, -den + 1e-6);
-    Jden = mean(den_violation.^2);
-
-    % smoothness / avoid pathological oscillation
-    d2Omega = numerical_derivative(w, dOmega);
-    Jsmooth = mean(d2Omega.^2);
+    % Keep Q modest to avoid pathological overfitting
+    Jq = mean(q(:).^2);
 
     J = Jfit ...
-      + lambda_pos   * Jpos ...
-      + lambda_mono  * Jmono ...
-      + lambda_den   * Jden ...
-      + lambda_smooth* Jsmooth;
+      + lambda_anchor  * Janchor ...
+      + lambda_smooth  * Jsmooth ...
+      + lambda_qenergy * Jq;
 
-    if any(~isfinite(R)) || any(~isfinite(Omega)) || ~isfinite(J)
+    if any(~isfinite(Omega)) || any(~isfinite(dOmega_raw)) || ~isfinite(J)
         J = 1e30;
     end
 end
 
-function [a, b] = unpack_theta(theta, m, n)
-    a = theta(1:m+1);
-    b = theta(m+2:m+1+n);
-end
-
-function [R, num, den] = eval_R_model(c, a, b)
-    % numpoly = a0 + a1*c + ... + am*c^m
-    numpoly = zeros(size(c));
-    for k = 0:length(a)-1
-        numpoly = numpoly + a(k+1) * c.^k;
+function [Qw, dOmega_raw, Omega] = build_monotonic_mapping(q, w, T)
+    % Q(w) = q0 + q1*cos(w) + q2*cos(2w) + ...
+    Qw = zeros(size(w));
+    for k = 0:length(q)-1
+        Qw = Qw + q(k+1) * cos(k*w);
     end
 
-    % den = 1 + b1*c + ... + bn*c^n
-    den = ones(size(c));
-    for k = 1:length(b)
-        den = den + b(k) * c.^k;
-    end
+    % Positive derivative by construction
+    dOmega_raw = exp(Qw);
 
-    num = (1 - c) .* numpoly;
-    R = num ./ den;
+    % Integrate from 0 to w
+    Omega_raw = cumtrapz(w, dOmega_raw);
+
+    % Normalize endpoints:
+    % enforce Omega(pi)=pi/T
+    scale = (pi/T) / Omega_raw(end);
+    Omega = scale * Omega_raw;
 end
 
 function H = analog_lp_response(Omega, w0, Q)
